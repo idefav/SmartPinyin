@@ -141,38 +141,51 @@ public final class SessionWorkingMemory: @unchecked Sendable {
 
         var promotedPhrase: (String, String, String)?
 
-        // 预先在锁外做拼音归一化，保证锁持有时间微秒级
+        // 预先在锁外做拼音归一化，保证锁持有时间微秒级（支持纯中文、中英混输词与英文标识符）
         let pureZh = Self.isPureChinese(trimmed)
-        let zhKeys: PinyinNormalizer.TermPinyinKeys? = (pureZh && trimmed.count >= 2 && trimmed.count <= 8)
-            ? normalizer.keys(forChineseTerm: trimmed)
-            : nil
         let isEnId = !pureZh && Self.isEnglishIdentifier(trimmed)
+        let isMixedBilingual = !pureZh && !isEnId && Self.isMixedChineseEnglish(trimmed)
+        let zhKeys: PinyinNormalizer.TermPinyinKeys? = {
+            if pureZh && trimmed.count >= 2 && trimmed.count <= 8 {
+                return normalizer.keys(forChineseTerm: trimmed)
+            }
+            if isMixedBilingual && trimmed.count >= 3 && trimmed.count <= 14 {
+                return normalizer.keys(forMixedTerm: trimmed)
+            }
+            return nil
+        }()
         let enKeys = isEnId ? normalizer.keys(forEnglishIdentifier: trimmed) : nil
 
-        // 检测相邻连词候选（需先读取上一个 chunk）
+        // 检测相邻连词候选（支持纯中文连词 + 中英混输连词，如 git + 地址 -> git地址、React + 组件 -> React组件）
         lock.lock()
         let prev = lastChunk
         lock.unlock()
 
         var chainedCandidate: (phrase: String, fullPinyin: String, initials: String, keys: PinyinNormalizer.TermPinyinKeys)?
         if enableAutoPhrase,
-           pureZh,
-           trimmed.count >= 1 && trimmed.count <= 4,
            let prev,
            prev.appBundleID == appBundleID,
-           (now - prev.timestamp) <= Self.chainWindowSeconds,
-           Self.isPureChinese(prev.text),
-           prev.text.count >= 1 && prev.text.count <= 4 {
-            let combined = prev.text + trimmed
-            if combined.count >= 2 && combined.count <= 6 && SensitiveTextFilter.isSafeMemoryToken(combined) {
-                let cKeys = normalizer.keys(forChineseTerm: combined)
-                let primaryFull = cKeys.primarySyllables.joined()
-                let primaryInit = cKeys.primarySyllables.compactMap { $0.first.map(String.init) }.joined()
-                if !primaryFull.isEmpty && !primaryInit.isEmpty {
-                    let exactJoinedPinyin = (!prev.pinyin.isEmpty && !(pinyin ?? "").isEmpty)
-                        ? (prev.pinyin + (pinyin ?? ""))
-                        : primaryFull
-                    chainedCandidate = (combined, exactJoinedPinyin, primaryInit, cKeys)
+           (now - prev.timestamp) <= Self.chainWindowSeconds {
+            let prevIsZh = Self.isPureChinese(prev.text)
+            let prevIsEn = !prevIsZh && Self.isEnglishIdentifier(prev.text)
+            let canChainZhZh = pureZh && prevIsZh && trimmed.count <= 4 && prev.text.count <= 4
+            let canChainEnZh = pureZh && prevIsEn && trimmed.count >= 1 && trimmed.count <= 4 && prev.text.count <= 10
+            let canChainZhEn = isEnId && prevIsZh && prev.text.count >= 1 && prev.text.count <= 4 && trimmed.count <= 10
+            if canChainZhZh || canChainEnZh || canChainZhEn {
+                let combined = prev.text + trimmed
+                let maxCombinedLen = canChainZhZh ? 6 : 14
+                if combined.count >= 2 && combined.count <= maxCombinedLen && SensitiveTextFilter.isSafeMemoryToken(combined) {
+                    let cKeys = canChainZhZh
+                        ? normalizer.keys(forChineseTerm: combined)
+                        : normalizer.keys(forMixedTerm: combined)
+                    let primaryFull = cKeys.primarySyllables.joined()
+                    let primaryInit = cKeys.initialVariants.first ?? ""
+                    if !primaryFull.isEmpty && !primaryInit.isEmpty {
+                        let exactJoinedPinyin = (canChainZhZh && !prev.pinyin.isEmpty && !(pinyin ?? "").isEmpty)
+                            ? (prev.pinyin + (pinyin ?? ""))
+                            : primaryFull
+                        chainedCandidate = (combined, exactJoinedPinyin, primaryInit, cKeys)
+                    }
                 }
             }
         }
@@ -193,18 +206,25 @@ public final class SessionWorkingMemory: @unchecked Sendable {
             appendSentenceLocked(sealed, appBundleID: appBundleID, now: now)
         }
 
-        // 2. 写入中文/英文主题词
+        // 2. 写入中文/中英混合/英文主题词
         if let zhKeys, !zhKeys.fullVariants.isEmpty {
             upsertChineseTermLocked(text: trimmed, keys: zhKeys, appBundleID: appBundleID, weight: 1.0, now: now)
         } else if let enKeys {
             upsertEnglishTermLocked(text: trimmed, lower: enKeys.lower, initials: enKeys.initials, appBundleID: appBundleID, weight: 1.0, now: now)
         }
 
-        // 3. 记录前文锚点（2~4 字） -> 当前上屏词
+        // 3. 记录前文锚点（2~4 字中文尾，或末尾完整英文词如 git / React） -> 当前上屏词
         let cleanLeft = Self.cleanAnchorText(leftContext)
-        if cleanLeft.count >= 2 && (pureZh || isEnId) {
+        if cleanLeft.count >= 2 && (pureZh || isEnId || isMixedBilingual) {
+            var anchorKeys = Set<String>()
             for len in [4, 3, 2] where cleanLeft.count >= len {
-                let anchor = String(cleanLeft.suffix(len))
+                anchorKeys.insert(String(cleanLeft.suffix(len)))
+            }
+            if let trailingEn = Self.trailingEnglishAnchor(in: cleanLeft) {
+                anchorKeys.insert(trailingEn)
+                anchorKeys.insert(trailingEn.lowercased())
+            }
+            for anchor in anchorKeys {
                 upsertTransitionLocked(anchor: anchor, nextText: trimmed, appBundleID: appBundleID, weight: 1.0, now: now)
             }
         }
@@ -231,7 +251,7 @@ public final class SessionWorkingMemory: @unchecked Sendable {
         }
 
         let normPin = (pinyin ?? "").lowercased().filter { $0 >= "a" && $0 <= "z" }
-        lastChunk = pureZh
+        lastChunk = (pureZh || isEnId)
             ? RecentCommitChunk(text: trimmed, pinyin: normPin, appBundleID: appBundleID, timestamp: now)
             : nil
 
@@ -310,6 +330,13 @@ public final class SessionWorkingMemory: @unchecked Sendable {
                         if combined.count >= 2 && combined.count <= 6, extractedZh[combined] == nil {
                             extractedZh[combined] = normalizer.keys(forChineseTerm: combined)
                         }
+                    } else if cur.isChinese != next.isChinese {
+                        let combined = cur.text + next.text
+                        if combined.count >= 3 && combined.count <= 14,
+                           extractedZh[combined] == nil,
+                           SensitiveTextFilter.isSafeMemoryToken(combined) {
+                            extractedZh[combined] = normalizer.keys(forMixedTerm: combined)
+                        }
                     }
                     if cur.isChinese {
                         // 直接从原句在 next 之前的真实左文取 2~4 字作锚点，避免单字介词/助词（如「出现」+「在」）断链！
@@ -328,6 +355,24 @@ public final class SessionWorkingMemory: @unchecked Sendable {
                                             if extractedZh[phrase] == nil {
                                                 extractedZh[phrase] = normalizer.keys(forChineseTerm: phrase)
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if cur.text.count >= 2 {
+                        let lowerAnchor = cur.text.lowercased()
+                        let anchors = (lowerAnchor == cur.text) ? [cur.text] : [cur.text, lowerAnchor]
+                        for ak in anchors {
+                            extractedTransitions.append((ak, next.text))
+                            if i + 2 < tokens.count, next.isChinese, tokens[i + 2].isChinese {
+                                let gap2 = tokens[i + 2].startOffset - (next.startOffset + next.text.count)
+                                if gap2 >= 0 && gap2 <= 1 {
+                                    let phrase = next.text + tokens[i + 2].text
+                                    if phrase.count <= 6 {
+                                        extractedTransitions.append((ak, phrase))
+                                        if extractedZh[phrase] == nil {
+                                            extractedZh[phrase] = normalizer.keys(forChineseTerm: phrase)
                                         }
                                     }
                                 }
@@ -388,23 +433,29 @@ public final class SessionWorkingMemory: @unchecked Sendable {
         let enSnap = Array(englishTerms.values)
         var contScores: [String: Double] = [:]
         if cleanLeft.count >= 2 {
-            for len in [4, 3, 2] where cleanLeft.count >= len {
-                let anchor = String(cleanLeft.suffix(len))
-                if let map = transitions[anchor] {
-                    for entry in map.values {
-                        let appFactor = Self.appShareFactor(
-                            entryApp: entry.lastAppBundleID,
-                            currentApp: appBundleID,
-                            shareAcrossApps: shareAcrossApps
-                        )
-                        guard appFactor > 0 else { continue }
-                        let decayed = Self.decayed(entry.recencyEMA, lastTS: entry.lastUsedTS, now: now)
-                        guard decayed >= 0.08 else { continue }
-                        let lenBonus = len >= 3 ? 1.25 : 1.0
-                        let score = min(2.4, (0.95 + log1p(Double(entry.count)) * 0.45 + min(0.9, decayed * 0.35)) * lenBonus * appFactor)
-                        contScores[entry.nextText] = max(contScores[entry.nextText] ?? 0, score)
-                    }
+            var checkedAnchors = Set<String>()
+            func accumulateTransitions(anchor: String, lenBonus: Double) {
+                guard checkedAnchors.insert(anchor).inserted, let map = transitions[anchor] else { return }
+                for entry in map.values {
+                    let appFactor = Self.appShareFactor(
+                        entryApp: entry.lastAppBundleID,
+                        currentApp: appBundleID,
+                        shareAcrossApps: shareAcrossApps
+                    )
+                    guard appFactor > 0 else { continue }
+                    let decayed = Self.decayed(entry.recencyEMA, lastTS: entry.lastUsedTS, now: now)
+                    guard decayed >= 0.08 else { continue }
+                    let score = min(2.4, (0.95 + log1p(Double(entry.count)) * 0.45 + min(0.9, decayed * 0.35)) * lenBonus * appFactor)
+                    contScores[entry.nextText] = max(contScores[entry.nextText] ?? 0, score)
                 }
+            }
+            for len in [4, 3, 2] where cleanLeft.count >= len {
+                accumulateTransitions(anchor: String(cleanLeft.suffix(len)), lenBonus: len >= 3 ? 1.25 : 1.0)
+            }
+            if let trailingEn = Self.trailingEnglishAnchor(in: cleanLeft) {
+                let bonus = trailingEn.count >= 3 ? 1.25 : 1.0
+                accumulateTransitions(anchor: trailingEn, lenBonus: bonus)
+                accumulateTransitions(anchor: trailingEn.lowercased(), lenBonus: bonus)
             }
         }
         lock.unlock()
@@ -493,23 +544,30 @@ public final class SessionWorkingMemory: @unchecked Sendable {
 
         lock.lock()
         var scores: [String: Double] = [:]
-        for len in [4, 3, 2] where cleanLeft.count >= len {
-            let anchor = String(cleanLeft.suffix(len))
-            if let map = transitions[anchor] {
-                for entry in map.values {
-                    guard entry.nextText.count >= 2 else { continue }
-                    let appFactor = Self.appShareFactor(
-                        entryApp: entry.lastAppBundleID,
-                        currentApp: appBundleID,
-                        shareAcrossApps: shareAcrossApps
-                    )
-                    guard appFactor > 0 else { continue }
-                    let decayed = Self.decayed(entry.recencyEMA, lastTS: entry.lastUsedTS, now: now)
-                    guard decayed >= 0.25 else { continue }
-                    let score = (decayed + Double(entry.count) * 0.45) * Double(len) * appFactor
-                    scores[entry.nextText] = max(scores[entry.nextText] ?? 0, score)
-                }
+        var checkedAnchors = Set<String>()
+        func accumulateImmediate(anchor: String, weight: Double) {
+            guard checkedAnchors.insert(anchor).inserted, let map = transitions[anchor] else { return }
+            for entry in map.values {
+                guard entry.nextText.count >= 2 else { continue }
+                let appFactor = Self.appShareFactor(
+                    entryApp: entry.lastAppBundleID,
+                    currentApp: appBundleID,
+                    shareAcrossApps: shareAcrossApps
+                )
+                guard appFactor > 0 else { continue }
+                let decayed = Self.decayed(entry.recencyEMA, lastTS: entry.lastUsedTS, now: now)
+                guard decayed >= 0.25 else { continue }
+                let score = (decayed + Double(entry.count) * 0.45) * weight * appFactor
+                scores[entry.nextText] = max(scores[entry.nextText] ?? 0, score)
             }
+        }
+        for len in [4, 3, 2] where cleanLeft.count >= len {
+            accumulateImmediate(anchor: String(cleanLeft.suffix(len)), weight: Double(len))
+        }
+        if let trailingEn = Self.trailingEnglishAnchor(in: cleanLeft) {
+            let weight = Double(min(4, trailingEn.count))
+            accumulateImmediate(anchor: trailingEn, weight: weight)
+            accumulateImmediate(anchor: trailingEn.lowercased(), weight: weight)
         }
         lock.unlock()
 
@@ -909,6 +967,44 @@ public final class SessionWorkingMemory: @unchecked Sendable {
                 || ($0.value >= 48 && $0.value <= 57)
                 || $0.value == 95
         }
+    }
+
+    private static func isMixedChineseEnglish(_ s: String) -> Bool {
+        guard s.count >= 2 && s.count <= 20 else { return false }
+        var hasChinese = false
+        var hasASCIIAlpha = false
+        for scalar in s.unicodeScalars {
+            if (0x4E00...0x9FFF).contains(scalar.value) || (0x3400...0x4DBF).contains(scalar.value) {
+                hasChinese = true
+            } else if (scalar.value >= 65 && scalar.value <= 90) || (scalar.value >= 97 && scalar.value <= 122) {
+                hasASCIIAlpha = true
+            } else if (scalar.value >= 48 && scalar.value <= 57)
+                || scalar.value == 95 || scalar.value == 45 || scalar.value == 43 || scalar.value == 46 {
+                continue
+            } else {
+                return false
+            }
+        }
+        return hasChinese && hasASCIIAlpha
+    }
+
+    private static func trailingEnglishAnchor(in text: String) -> String? {
+        guard let last = text.last,
+              last.isASCII && (last.isLetter || last.isNumber || last == "_") else {
+            return nil
+        }
+        var chars: [Character] = []
+        for ch in text.reversed() {
+            if ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_") {
+                chars.append(ch)
+                if chars.count > 24 { return nil }
+            } else {
+                break
+            }
+        }
+        let word = String(chars.reversed())
+        guard word.count >= 2, let first = word.first, first.isLetter else { return nil }
+        return word
     }
 
     private static func decayed(_ value: Double, lastTS: TimeInterval, now: TimeInterval) -> Double {

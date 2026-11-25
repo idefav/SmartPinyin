@@ -34,6 +34,34 @@ public enum TranslateSpaceBehavior: String, CaseIterable, Codable, Identifiable,
     }
 }
 
+/// 整句暂存与校对模式下按下空格键的交互策略
+public enum DraftSpaceBehavior: String, CaseIterable, Codable, Identifiable, Sendable {
+    /// 两段空格（默认）：拼写态按空格选词进草稿校对，确认无误后再按一次空格一次性上屏整句
+    case stageThenCommit
+    /// 传统拼句：拼写态按空格选词进草稿，非拼写态按空格补空格，按回车上屏整句
+    case composeChineseSegment
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .stageThenCommit: return "选词进草稿，再按空格上屏整句（推荐）"
+        case .composeChineseSegment: return "选词进草稿，空态补空格（回车上屏整句）"
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case Self.composeChineseSegment.rawValue:
+            self = .composeChineseSegment
+        default:
+            // 向后兼容旧值（含过渡值 commitDraft），默认回落为两段空格策略
+            self = .stageThenCommit
+        }
+    }
+}
+
 /// 空态快速切换翻译模式 / 目标语言的修饰键手势
 public enum TranslateQuickGesture: String, CaseIterable, Codable, Identifiable, Sendable {
     /// 短按右 Option 0ms 开关翻译 · 双击右 Option 弹出 1–6 语种直选条（左 Option 完全不动）
@@ -103,6 +131,34 @@ public enum GlobalDisableTranslateShortcut: String, CaseIterable, Codable, Ident
     }
 }
 
+/// 一键全局开关「整句暂存与校对模式」快捷键
+public enum DraftModeToggleShortcut: String, CaseIterable, Codable, Identifiable, Sendable {
+    /// Control + Option + D（⌃⌥D，推荐，与 ⌃⌥T 对称且零热键冲突）
+    case controlOptionD
+    /// Option + Shift + D（⌥⇧D）
+    case optionShiftD
+    /// 关闭快捷键
+    case off
+
+    public var id: String { rawValue }
+
+    public var badge: String {
+        switch self {
+        case .controlOptionD: return "⌃⌥D"
+        case .optionShiftD: return "⌥⇧D"
+        case .off: return ""
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .controlOptionD: return "Control + Option + D（⌃⌥D，推荐）"
+        case .optionShiftD: return "Option + Shift + D（⌥⇧D）"
+        case .off: return "关闭快捷键"
+        }
+    }
+}
+
 /// 句末智能联想的展示与接入方式
 public enum PredictionDisplayStyle: String, Codable, CaseIterable, Sendable, Identifiable {
     /// 停顿浮现紧凑联想条 + 不停顿敲首字母 0ms 融入候选栏首位（推荐）
@@ -156,14 +212,28 @@ public struct SmartPinyinPreferences: Codable, Equatable, Sendable {
     public var traditionalChinese: Bool
     public var enableEmojiCandidates: Bool
     public var enableAbbrevPinyin: Bool
-    /// 智能拼音自动纠错（覆盖邻键误触、跨排错键、字母倒序、漏键与多敲连键）
+    /// 智能拼音自动纠错（覆盖邻键误触、跨排错键、字母倒序、漏键与多敲连键；兼控英文拼写纠错）
     public var enableAutoCorrection: Bool
+    /// 中英文混输、离线英文词典补全与英文拼写纠错（如 gitdiz -> git地址、wodegit -> 我的git、dokcer -> Docker）
+    public var enableMixedBilingualAssist: Bool
     /// 前后鼻音模糊容错（an↔ang、en↔eng、in↔ing、ian↔iang、uan↔uang）
     public var fuzzyNasalPinyin: Bool
     /// 平翘舌模糊容错（zh↔z、ch↔c、sh↔s）
     public var fuzzyRetroflexPinyin: Bool
     /// 鼻边音与唇齿音模糊容错（n↔l、f↔h）
     public var fuzzyNLAndFHPinyin: Bool
+    /// 超长输入或找不到匹配内容时自动切入单字逐选模式（支持逐字挑选、翻页与音节边界微调）
+    public var enableAutoSingleCharFallback: Bool
+
+    // 1.5 整句暂存与整体错字纠偏模式
+    /// 全局「整句暂存与校对模式」：底栏实时错字纠偏，默认空格直接上屏整句，1–9 选词拼句
+    public var defaultDraftProofreadMode: Bool
+    /// 整句暂存与校对模式下按下空格键的行为（默认直接上屏整句，可切换为选词拼句）
+    public var draftSpaceBehavior: DraftSpaceBehavior
+    /// 暂存模式下自动使用本地 Qwen3-0.6B 进行整句语义错字纠偏（100% 离线，复用 .light 槽）
+    public var enableAIDraftProofread: Bool
+    /// 一键全局开关「整句暂存与校对模式」快捷键（默认 ⌃⌥D）
+    public var draftModeToggleShortcut: DraftModeToggleShortcut
 
     // 2. 本地偏好记忆、文档联动与小模型增强（Qwen3-0.6B）
     public var enablePersonalMemory: Bool
@@ -235,9 +305,15 @@ public struct SmartPinyinPreferences: Codable, Equatable, Sendable {
         enableEmojiCandidates: Bool = true,
         enableAbbrevPinyin: Bool = true,
         enableAutoCorrection: Bool = true,
+        enableMixedBilingualAssist: Bool = true,
         fuzzyNasalPinyin: Bool = true,
         fuzzyRetroflexPinyin: Bool = false,
         fuzzyNLAndFHPinyin: Bool = false,
+        enableAutoSingleCharFallback: Bool = true,
+        defaultDraftProofreadMode: Bool = false,
+        draftSpaceBehavior: DraftSpaceBehavior = .stageThenCommit,
+        enableAIDraftProofread: Bool = true,
+        draftModeToggleShortcut: DraftModeToggleShortcut = .controlOptionD,
         enablePersonalMemory: Bool = true,
         enableWorkingMemory: Bool = true,
         shareWorkingMemoryAcrossApps: Bool = true,
@@ -283,9 +359,15 @@ public struct SmartPinyinPreferences: Codable, Equatable, Sendable {
         self.enableEmojiCandidates = enableEmojiCandidates
         self.enableAbbrevPinyin = enableAbbrevPinyin
         self.enableAutoCorrection = enableAutoCorrection
+        self.enableMixedBilingualAssist = enableMixedBilingualAssist
         self.fuzzyNasalPinyin = fuzzyNasalPinyin
         self.fuzzyRetroflexPinyin = fuzzyRetroflexPinyin
         self.fuzzyNLAndFHPinyin = fuzzyNLAndFHPinyin
+        self.enableAutoSingleCharFallback = enableAutoSingleCharFallback
+        self.defaultDraftProofreadMode = defaultDraftProofreadMode
+        self.draftSpaceBehavior = draftSpaceBehavior
+        self.enableAIDraftProofread = enableAIDraftProofread
+        self.draftModeToggleShortcut = draftModeToggleShortcut
         self.enablePersonalMemory = enablePersonalMemory
         self.enableWorkingMemory = enableWorkingMemory
         self.shareWorkingMemoryAcrossApps = shareWorkingMemoryAcrossApps
@@ -336,9 +418,15 @@ public struct SmartPinyinPreferences: Codable, Equatable, Sendable {
             enableEmojiCandidates: try c.decodeIfPresent(Bool.self, forKey: .enableEmojiCandidates) ?? d.enableEmojiCandidates,
             enableAbbrevPinyin: try c.decodeIfPresent(Bool.self, forKey: .enableAbbrevPinyin) ?? d.enableAbbrevPinyin,
             enableAutoCorrection: try c.decodeIfPresent(Bool.self, forKey: .enableAutoCorrection) ?? d.enableAutoCorrection,
+            enableMixedBilingualAssist: try c.decodeIfPresent(Bool.self, forKey: .enableMixedBilingualAssist) ?? d.enableMixedBilingualAssist,
             fuzzyNasalPinyin: try c.decodeIfPresent(Bool.self, forKey: .fuzzyNasalPinyin) ?? d.fuzzyNasalPinyin,
             fuzzyRetroflexPinyin: try c.decodeIfPresent(Bool.self, forKey: .fuzzyRetroflexPinyin) ?? d.fuzzyRetroflexPinyin,
             fuzzyNLAndFHPinyin: try c.decodeIfPresent(Bool.self, forKey: .fuzzyNLAndFHPinyin) ?? d.fuzzyNLAndFHPinyin,
+            enableAutoSingleCharFallback: try c.decodeIfPresent(Bool.self, forKey: .enableAutoSingleCharFallback) ?? d.enableAutoSingleCharFallback,
+            defaultDraftProofreadMode: try c.decodeIfPresent(Bool.self, forKey: .defaultDraftProofreadMode) ?? d.defaultDraftProofreadMode,
+            draftSpaceBehavior: try c.decodeIfPresent(DraftSpaceBehavior.self, forKey: .draftSpaceBehavior) ?? d.draftSpaceBehavior,
+            enableAIDraftProofread: try c.decodeIfPresent(Bool.self, forKey: .enableAIDraftProofread) ?? d.enableAIDraftProofread,
+            draftModeToggleShortcut: try c.decodeIfPresent(DraftModeToggleShortcut.self, forKey: .draftModeToggleShortcut) ?? d.draftModeToggleShortcut,
             enablePersonalMemory: try c.decodeIfPresent(Bool.self, forKey: .enablePersonalMemory) ?? d.enablePersonalMemory,
             enableWorkingMemory: try c.decodeIfPresent(Bool.self, forKey: .enableWorkingMemory) ?? d.enableWorkingMemory,
             shareWorkingMemoryAcrossApps: try c.decodeIfPresent(Bool.self, forKey: .shareWorkingMemoryAcrossApps) ?? d.shareWorkingMemoryAcrossApps,

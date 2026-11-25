@@ -148,7 +148,7 @@
      ======================================================================== */
   const HERO_DEMOS = [
     {
-      tag: '演示 1/4 · 三级快打自动纠错',
+      tag: '演示 1/5 · 三级快打自动纠错',
       latency: 'L1 0.58 ms',
       mode: '中文',
       scene: '拼 · 自动纠偏',
@@ -166,7 +166,41 @@
       translate: null
     },
     {
-      tag: '演示 2/4 · 诗词与成语微胶囊',
+      tag: '演示 2/5 · 中英文免切混输与英文纠错',
+      latency: '73K EN · 0.62 ms',
+      mode: '中英',
+      scene: '拼 · 中英混输',
+      committed: '发我一下',
+      preedit: 'gitdiz',
+      pinyin: 'git + di zhi',
+      candidates: [
+        { text: 'git地址', badge: '混', badgeClass: 'badge-mixed' },
+        { text: 'git地址栏', badge: '混', badgeClass: 'badge-mixed' },
+        { text: 'git', badge: '英', badgeClass: 'badge-mixed' },
+        { text: '给她的' }
+      ],
+      finalCommit: '发我一下git地址',
+      predict: null,
+      translate: null
+    },
+    {
+      tag: '演示 3/5 · 整句暂存两段空格自动校对',
+      latency: 'L1+L2 五重护栏',
+      mode: '校对',
+      scene: '草稿 · 再按空格上屏',
+      committed: '',
+      preedit: '我门昨天部暑了新版本',
+      pinyin: '草稿自动纠偏  ·  ⇧↩ 保留原稿',
+      candidates: [
+        { text: '我们昨天部署了新版本', badge: '纠', badgeClass: 'badge-typo' },
+        { text: '我门昨天部暑了新版本（原稿）' }
+      ],
+      finalCommit: '我们昨天部署了新版本',
+      predict: null,
+      translate: null
+    },
+    {
+      tag: '演示 4/5 · 诗词与成语微胶囊',
       latency: 'Tag 0.015 ms',
       mode: '中文',
       scene: '拼 · 诗词',
@@ -184,20 +218,7 @@
       translate: null
     },
     {
-      tag: '演示 3/4 · 全文语境联想续写',
-      latency: 'L2 Qwen3-0.6B',
-      mode: '中文',
-      scene: '拼 · 语境联想',
-      committed: '上海植物园',
-      preedit: '',
-      pinyin: '',
-      candidates: null,
-      finalCommit: '上海植物园门票攻略',
-      predict: ['1 门票攻略', '2 开放时间', '3 交通路线'],
-      translate: null
-    },
-    {
-      tag: '演示 4/4 · 100% 离线实时翻译上屏',
+      tag: '演示 5/5 · 100% 离线实时翻译上屏',
       latency: 'XPC HY-MT 1.8B',
       mode: '译 → EN',
       scene: '译 · EN',
@@ -317,11 +338,11 @@
      5. Sticky Scrollytelling 五大章节交互动画控制器
      ======================================================================== */
   const STORY_TITLES = [
-    'SmartPinyin · 三级快打自动纠错',
+    'SmartPinyin · 中英三级快打自动纠错',
     'SmartPinyin · 诗词/成语与 0ms 场景适配',
-    'SmartPinyin · 语境联想与中英混输',
+    'SmartPinyin · 中英混输、整句校对与联想',
     'SmartPinyin · XPC 离线翻译 (< 2GB)',
-    'SmartPinyin · 开源词库中心与零残留自卸载'
+    'SmartPinyin · 开源词库中心与防损自卸载'
   ];
 
   const TYPO_PRESETS = {
@@ -353,18 +374,30 @@
         { text: '善待' }
       ]
     },
-    beijign: {
-      typed: 'beijign',
-      seg: 'bei ji gn  →  bei jing',
-      raw: 'beijign',
-      fixed: 'beijing',
-      writeback: '北京 (beijing)',
-      latency: 'Transpose Fix · 0.54 ms',
+    dokcer: {
+      typed: 'dokcer',
+      seg: 'dokcer  →  Docker (QWERTY 转置纠偏)',
+      raw: 'dokcer',
+      fixed: 'Docker',
+      writeback: 'Docker (en-spell)',
+      latency: 'EN Two-Tier · 0.42 ms',
       cands: [
-        { text: '北京', badge: '纠', badgeClass: 'badge-typo' },
-        { text: '背景' },
-        { text: '倍增' },
-        { text: '北境' }
+        { text: 'Docker', badge: '纠', badgeClass: 'badge-typo' },
+        { text: 'dokcer', badge: '英', badgeClass: 'badge-mixed' },
+        { text: 'docker', badge: '英', badgeClass: 'badge-mixed' }
+      ]
+    },
+    gtidiz: {
+      typed: 'gtidiz',
+      seg: 'gti → git  +  di zhi',
+      raw: 'gtidiz',
+      fixed: 'git + dizhi',
+      writeback: 'git地址 (bilingual)',
+      latency: 'Bilingual Fix · 0.58 ms',
+      cands: [
+        { text: 'git地址', badge: '纠', badgeClass: 'badge-typo' },
+        { text: 'git地址栏', badge: '混', badgeClass: 'badge-mixed' },
+        { text: '改天的' }
       ]
     }
   };
@@ -501,7 +534,7 @@
   let stageAbort = null;
   let activeTypoKey = 'shaighai';
   let activeSceneKey = 'poetry';
-  let activeCtxMode = 'predict';
+  let activeCtxMode = 'mixed';
   let activeLangKey = 'EN';
   let activeLifeMode = 'lexicon';
 
@@ -569,13 +602,58 @@
       const latPill = document.getElementById('ctxLatencyPill');
       const committed = document.getElementById('ctxCommitted');
       const preedit = document.getElementById('ctxPreedit');
+      const ctxHud = document.getElementById('ctxHud');
+      const ctxHudPinyin = document.getElementById('ctxHudPinyin');
+      const ctxSceneChip = document.getElementById('ctxSceneChip');
+      const ctxCandidates = document.getElementById('ctxCandidates');
       const predictStrip = document.getElementById('ctxPredictStrip');
       const predictItems = document.getElementById('ctxPredictItems');
       const mixedCard = document.getElementById('ctxMixedCard');
 
-      if (activeCtxMode === 'predict') {
+      if (activeCtxMode === 'mixed') {
+        if (appPill) appPill.textContent = 'VS Code · 中英免切混输';
+        if (latPill) latPill.textContent = '73K 英文词库 · 0.55 ms';
+        if (predictStrip) predictStrip.classList.add('hidden');
+        if (mixedCard) mixedCard.classList.remove('hidden');
+        if (ctxHud) ctxHud.classList.remove('hidden');
+        if (ctxHudPinyin) ctxHudPinyin.textContent = '';
+        if (ctxSceneChip) ctxSceneChip.textContent = '拼 · 中英混输';
+        if (ctxCandidates) ctxCandidates.replaceChildren();
+        if (committed) committed.textContent = '请发一下 ';
+        if (preedit) preedit.textContent = '';
+
+        const ok = await typeText(preedit, 'reactzj', 65, signal);
+        if (!ok) return;
+        if (ctxHudPinyin) ctxHudPinyin.textContent = 'React + zu jian';
+        renderCandidates(ctxCandidates, [
+          { text: 'React组件', badge: '混', badgeClass: 'badge-mixed' },
+          { text: 'React总结', badge: '混', badgeClass: 'badge-mixed' },
+          { text: 'React', badge: '英', badgeClass: 'badge-mixed' },
+          { text: 'react', badge: '英', badgeClass: 'badge-mixed' }
+        ]);
+      } else if (activeCtxMode === 'draft') {
+        if (appPill) appPill.textContent = '飞书 · 整句暂存校对（⌃⌥D）';
+        if (latPill) latPill.textContent = '两段空格 · L1+L2 五重护栏';
+        if (predictStrip) predictStrip.classList.add('hidden');
+        if (mixedCard) mixedCard.classList.add('hidden');
+        if (ctxHud) ctxHud.classList.remove('hidden');
+        if (ctxHudPinyin) ctxHudPinyin.textContent = '';
+        if (ctxSceneChip) ctxSceneChip.textContent = '草稿 · 再按空格上屏';
+        if (ctxCandidates) ctxCandidates.replaceChildren();
+        if (committed) committed.textContent = '';
+        if (preedit) preedit.textContent = '';
+
+        const ok = await typeText(preedit, '我门昨天部暑了新版本', 55, signal);
+        if (!ok) return;
+        if (ctxHudPinyin) ctxHudPinyin.textContent = '自动纠偏完成 · ⇧↩ 保留原稿 · ⌥⌫ 整段撤回';
+        renderCandidates(ctxCandidates, [
+          { text: '我们昨天部署了新版本', badge: '纠', badgeClass: 'badge-typo' },
+          { text: '我门昨天部暑了新版本（原稿）' }
+        ]);
+      } else {
         if (appPill) appPill.textContent = '微信 · 对话窗口';
         if (latPill) latPill.textContent = 'Session Memory · 0ms 去重';
+        if (ctxHud) ctxHud.classList.add('hidden');
         if (mixedCard) mixedCard.classList.add('hidden');
         if (predictStrip) predictStrip.classList.add('hidden');
         if (preedit) preedit.textContent = '';
@@ -593,15 +671,6 @@
           );
           predictStrip.classList.remove('hidden');
         }
-      } else {
-        if (appPill) appPill.textContent = 'VS Code · TypeScript 编辑器';
-        if (latPill) latPill.textContent = '中英混输 · 免切 Shift';
-        if (predictStrip) predictStrip.classList.add('hidden');
-        if (mixedCard) mixedCard.classList.remove('hidden');
-        if (committed) committed.textContent = '使用 ';
-        if (preedit) preedit.textContent = '';
-        const ok = await typeText(preedit, 'React Hook 校验 user_id 字段', 50, signal);
-        if (!ok) return;
       }
       return;
     }

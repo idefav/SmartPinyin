@@ -42,6 +42,15 @@ import Foundation
         withReply reply: @escaping (Data?) -> Void
     )
 
+    /// 整句暂存错别字语义校对（复用 .light 槽 Qwen3-0.6B，100% 离线，严格 < 2GB）。
+    /// 返回 JSON 编码的 ProofreadReplyPayload；模型不可用或翻译槽活跃时返回 nil。
+    func proofreadSentence(
+        sourceText: String,
+        leftContext: String,
+        requestID: String,
+        withReply reply: @escaping (Data?) -> Void
+    )
+
     /// 抢占式取消进行中的推理请求，避免高速打字引发队列堆积。
     func cancelRequest(requestID: String)
 
@@ -71,6 +80,32 @@ public struct TranslationReplyPayload: Codable, Sendable {
         physicalFootprintMB: Double
     ) {
         self.translatedText = translatedText
+        self.latencyMs = latencyMs
+        self.fromCache = fromCache
+        self.backendName = backendName
+        self.physicalFootprintMB = physicalFootprintMB
+    }
+}
+
+/// XPC 整句校对应答负载
+public struct ProofreadReplyPayload: Codable, Sendable {
+    public let correctedText: String
+    public let hasChanges: Bool
+    public let latencyMs: Double
+    public let fromCache: Bool
+    public let backendName: String
+    public let physicalFootprintMB: Double
+
+    public init(
+        correctedText: String,
+        hasChanges: Bool,
+        latencyMs: Double,
+        fromCache: Bool,
+        backendName: String,
+        physicalFootprintMB: Double
+    ) {
+        self.correctedText = correctedText
+        self.hasChanges = hasChanges
         self.latencyMs = latencyMs
         self.fromCache = fromCache
         self.backendName = backendName

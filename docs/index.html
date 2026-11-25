@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SmartPinyin — 为 Apple Silicon 而生的 macOS 原生智能拼音输入法</title>
-  <meta name="description" content="SmartPinyin：基于 InputMethodKit、librime 万象词库与本地 Metal 小模型的 macOS 原生智能输入法。快打纠错、诗词成语标识、0ms 智能场景词库、语境联想与离线翻译，严格 < 2GB 内存，100% 离线隐私。" />
+  <meta name="description" content="SmartPinyin：基于 InputMethodKit、librime 万象词库与本地 Metal 小模型的 macOS 原生智能输入法。中英免切混输与 7.3 万离线英文词库、双层拼写纠错、两段空格整句自动校对、诗词成语标识、0ms 八大场景词库与离线六语种翻译，严格 < 2GB 内存，100% 离线隐私。" />
   <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -61,7 +61,7 @@
           </h1>
           <p class="hero-subtitle">
             融合 <code>librime 1.17</code> 万象语法模型与独立 XPC 进程 Metal 本地小模型：
-            <code>0.61 ms</code> 极速响应、三级快打纠错、诗词成语微胶囊、0ms 八大场景智能词库与离线多语种翻译——全程峰值内存严格低于 <strong>2 GB</strong>。
+            <code>0.61 ms</code> 极速响应、中英免切混输与双层英文拼写纠错、两段空格整句错字校对、诗词成语微胶囊、0ms 八大场景词库与离线六语种翻译——全程峰值内存严格低于 <strong>2 GB</strong>。
           </p>
           <div class="hero-cta">
             <a class="btn btn-primary btn-lg" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">
@@ -75,9 +75,9 @@
           </div>
           <div class="hero-badges">
             <div class="mini-stat"><strong>0.61 ms</strong><span>L1 拼音 P50</span></div>
-            <div class="mini-stat"><strong>33.4 MB</strong><span>IMK 宿主常驻</span></div>
+            <div class="mini-stat"><strong>73,171</strong><span>离线英文词库</span></div>
             <div class="mini-stat"><strong>56,828</strong><span>诗词与成语索引</span></div>
-            <div class="mini-stat"><strong>0 云端</strong><span>密码框硬阻断</span></div>
+            <div class="mini-stat"><strong>33.4 MB</strong><span>IMK 宿主常驻</span></div>
           </div>
         </div>
 
@@ -126,9 +126,10 @@
             </div>
             <div class="hero-demo-dots" id="heroDemoDots" aria-label="演示切换">
               <button type="button" class="demo-dot active" data-demo="0">快打纠错</button>
-              <button type="button" class="demo-dot" data-demo="1">诗词标识</button>
-              <button type="button" class="demo-dot" data-demo="2">语境联想</button>
-              <button type="button" class="demo-dot" data-demo="3">离线翻译</button>
+              <button type="button" class="demo-dot" data-demo="1">中英混输</button>
+              <button type="button" class="demo-dot" data-demo="2">整句校对</button>
+              <button type="button" class="demo-dot" data-demo="3">诗词标识</button>
+              <button type="button" class="demo-dot" data-demo="4">离线翻译</button>
             </div>
           </div>
         </div>
@@ -155,16 +156,17 @@
             <article class="story-step active" data-step="0" tabindex="0">
               <div class="step-rail"><span class="step-index">01</span><div class="step-line"><div class="step-line-fill"></div></div></div>
               <div class="step-body">
-                <span class="step-tag tag-amber">三级自动纠错 · 可配置模糊音</span>
-                <h3>打太快敲错字母？<br />影子探针 0.6ms 自动纠偏</h3>
+                <span class="step-tag tag-amber">三级中文纠错 · 双层英文拼写纠偏</span>
+                <h3>中英打太快敲错字母？<br />影子探针 0.6ms 自动纠偏</h3>
                 <p>
-                  不再为错键、漏键、连键或前后鼻音混淆（<code>an↔ang / en↔eng / in↔ing</code>）停顿退格。
-                  基于惰性只读 <code>probe_session_id</code> 与音节密度过滤，错拼直接置顶并标注 <code>纠</code> 徽章；选词后自动按正确拼音写入用户记忆，绝不污染词库。
+                  不再为中英文错键、漏键、倒序或前后鼻音混淆（<code>an↔ang / en↔eng / in↔ing</code>）停顿退格。
+                  中文基于惰性只读 <code>probe_session_id</code> 自动回写正确拼音记忆；英文及混输依托 73,171 离线词库与 QWERTY 邻键加权编辑距离，把 <code>dokcer</code>、<code>gtidiz</code> 秒级拉回正轨。
                 </p>
                 <div class="step-controls" data-control="typo">
                   <button type="button" class="chip-btn active" data-typo="shaighai">shaighai → 上海</button>
                   <button type="button" class="chip-btn" data-typo="shanhai">shanhai → 山海 / 上海</button>
-                  <button type="button" class="chip-btn" data-typo="beijign">beijign → 北京</button>
+                  <button type="button" class="chip-btn" data-typo="dokcer">dokcer → Docker</button>
+                  <button type="button" class="chip-btn" data-typo="gtidiz">gtidiz → git地址</button>
                 </div>
               </div>
             </article>
@@ -192,15 +194,16 @@
             <article class="story-step" data-step="2" tabindex="0">
               <div class="step-rail"><span class="step-index">03</span><div class="step-line"><div class="step-line-fill"></div></div></div>
               <div class="step-body">
-                <span class="step-tag tag-cyan">语境记忆联想 · 中英混输快车道</span>
-                <h3>记住你刚删改的前文，<br />中英代码零切换直出</h3>
+                <span class="step-tag tag-cyan">中英免切混输 · 两段空格整句校对 · 语境联想</span>
+                <h3>中英混输零切换，<br />整句暂存自动纠错再上屏</h3>
                 <p>
-                  工作记忆实时跟踪已上屏片段与退格修改，彻底消除联想重复。上屏后单手按 <code>1 / 2 / 3</code> 或 <code>Tab</code> 即可续写，继续敲首字母 0ms 融入首位。
-                  输入 <code>React</code>、<code>HTTPRequest</code>、<code>user_id</code> 等驼峰/大写/下划线标识符免按 Shift 直出。
+                  无需切英文模式，<code>gitdiz → git地址</code>、<code>reactzj → React组件</code>、<code>Recat + Tab → React</code> 自然混输并支持双语自学习与英文锚点续写；
+                  按 <code>⌃⌥D</code> 开启「整句暂存校对」，首空格入草稿由 L1 规则 + <code>Qwen3-0.6B</code> 五重护栏自动纠偏，再空格整句上屏；更有会话记忆 0ms 去重续写与 <code>⌥C</code> 单字逐选兜底。
                 </p>
                 <div class="step-controls" data-control="context">
-                  <button type="button" class="chip-btn active" data-ctx="predict">语境联想续写</button>
-                  <button type="button" class="chip-btn" data-ctx="mixed">中英混输快车道</button>
+                  <button type="button" class="chip-btn active" data-ctx="mixed">中英混输与纠错</button>
+                  <button type="button" class="chip-btn" data-ctx="draft">两段空格整句校对</button>
+                  <button type="button" class="chip-btn" data-ctx="predict">语境联想续写</button>
                 </div>
               </div>
             </article>
@@ -229,8 +232,8 @@
                 <span class="step-tag tag-emerald">开源词库热更新 · 6 步零残留自卸载</span>
                 <h3>生态词库随时热更新，<br />来去自由一键彻底清理</h3>
                 <p>
-                  在 <code>SmartPinyin Setup</code>「词库与场景」一键同步万象每日词库、THUOCL 学科词库、萌娘/维基百科或自定义 <code>.dict.yaml</code>，原子部署后后台静默热重载。
-                  覆盖升级就地保留目录 inode 与辅助功能 TCC 权限；卸载时强白名单 6 步零残留自删自身。
+                  在 <code>SmartPinyin Setup</code>「词库与场景」一键同步万象每日词库、THUOCL 学科词库、萌娘/维基百科或自定义 <code>.dict.yaml</code>，原子部署后静默热重载；Lite 包下载模型免重启即刻生效，Full PKG 消除 1.46 GB 冗余模型。
+                  覆盖升级保留 inode 与 TCC 权限；卸载采用单次同步提权、取消授权自动回滚防损与 6 步零残留自删。
                 </p>
                 <div class="step-controls" data-control="lifecycle">
                   <button type="button" class="chip-btn active" data-life="lexicon">词库热更新中心</button>
@@ -318,29 +321,35 @@
                   </div>
                 </div>
 
-                <!-- Panel 2: Context Prediction & Mixed CN/EN -->
+                <!-- Panel 2: Mixed CN/EN, Draft Proofread & Context Prediction -->
                 <div class="stage-panel" data-panel="2">
                   <div class="stage-editor-box">
                     <div class="stage-app-hint">
-                      <span class="app-pill" id="ctxAppPill">微信 · 对话窗口</span>
-                      <span class="latency-pill" id="ctxLatencyPill">Session Memory · 0ms 去重</span>
+                      <span class="app-pill" id="ctxAppPill">VS Code · 中英免切混输</span>
+                      <span class="latency-pill" id="ctxLatencyPill">73K 英文词库 · 双语记忆</span>
                     </div>
                     <div class="stage-input-line ctx-line">
                       <span id="ctxCommitted"></span><span class="typed-preedit" id="ctxPreedit"></span><span class="caret"></span>
                     </div>
-                    <div class="predict-strip stage-predict" id="ctxPredictStrip">
+                    <div class="ime-hud stage-hud hidden" id="ctxHud">
+                      <div class="hud-top">
+                        <span class="hud-pinyin" id="ctxHudPinyin">git + di zhi</span>
+                        <span class="scene-chip" id="ctxSceneChip">拼 · 中英混输</span>
+                      </div>
+                      <div class="hud-candidates" id="ctxCandidates"></div>
+                    </div>
+                    <div class="predict-strip stage-predict hidden" id="ctxPredictStrip">
                       <span class="predict-label">联想</span>
                       <div class="predict-items" id="ctxPredictItems"></div>
                     </div>
-                    <div class="mixed-fastlane hidden" id="ctxMixedCard">
+                    <div class="mixed-fastlane" id="ctxMixedCard">
                       <div class="fastlane-row">
-                        <span class="fastlane-badge">免切 Shift</span>
-                        <span class="fastlane-token">React</span>
-                        <span class="fastlane-token">user_id</span>
-                        <span class="fastlane-token">useEffect</span>
-                        <span class="fastlane-token">HTTP/3</span>
+                        <span class="fastlane-badge">免切中英</span>
+                        <span class="fastlane-token">gitdiz → git地址</span>
+                        <span class="fastlane-token">reactzj → React组件</span>
+                        <span class="fastlane-token">Recat+Tab → React</span>
                       </div>
-                      <p class="fastlane-desc">识别大写、驼峰、下划线与代码符号，自动启用英文直出快车道与半角标点。</p>
+                      <p class="fastlane-desc">内置 73,171 离线英文词库与技术词大小写规范，混输自动标 <code>混</code> / <code>英</code>，临时英文按 <code>Space</code> 保留原词、按 <code>Tab</code> 一键纠错。</p>
                     </div>
                   </div>
                 </div>
@@ -422,12 +431,12 @@
                     </div>
                     <!-- 卸载视图 -->
                     <div class="uninstall-checklist hidden" id="lifeUninstallView">
-                      <div class="check-item"><span class="chk">✓</span>1. 自动切回系统英文键盘并禁用输入源</div>
-                      <div class="check-item"><span class="chk">✓</span>2. 优雅停止 SmartPinyin 与 XPC 推理服务</div>
+                      <div class="check-item"><span class="chk">✓</span>1. 切回系统英文键盘并禁用/注销输入源</div>
+                      <div class="check-item"><span class="chk">✓</span>2. 单次同步管理员提权，取消授权自动回滚恢复不损安装</div>
                       <div class="check-item"><span class="chk">✓</span>3. DeletionPathValidator 强白名单路径防穿越校验</div>
-                      <div class="check-item"><span class="chk">✓</span>4. 按勾选独立保留或清除词库 / LexiconPacks / GGUF 模型</div>
-                      <div class="check-item"><span class="chk">✓</span>5. 清理系统偏好与陈旧 IntlDataCache 缓存</div>
-                      <div class="check-item"><span class="chk">✓</span>6. 生成脱离会话一次性脚本安全自删卸载器本体</div>
+                      <div class="check-item"><span class="chk">✓</span>4. 按勾选精确保留或清除用户词库 / 扩展包 / GGUF 模型</div>
+                      <div class="check-item"><span class="chk">✓</span>5. 清理偏好、Setup 缓存、HTTPStorages、PKG 收据与 IntlDataCache</div>
+                      <div class="check-item"><span class="chk">✓</span>6. 脱离会话一次性脚本安全自删卸载器本体</div>
                     </div>
                   </div>
                 </div>
@@ -444,7 +453,7 @@
         <div class="section-header" data-reveal>
           <span class="section-kicker">VERIFIED PERFORMANCE</span>
           <h2>硬核实测数据，拒绝纸面参数</h2>
-          <p>在 Apple Silicon 原生 Release 构建下实测验收，每一步改动均由 76 项自动化单元测试与 Mach-O 零路径泄漏门禁守护。</p>
+          <p>在 Apple Silicon 原生 Release 构建下实测验收，每一步改动均由 105 项自动化单元测试、<code>@rpath</code> 闭环与 Mach-O 零路径泄漏门禁守护。</p>
         </div>
 
         <div class="metrics-grid">
@@ -473,16 +482,16 @@
             <p class="metric-note">31,180 成语 + 25,648 古诗词名句</p>
           </div>
           <div class="metric-card" data-reveal style="--stagger: 4">
-            <div class="metric-value"><span class="counter" data-target="50851" data-decimals="0">0</span><small>词</small></div>
-            <div class="metric-label">8 大专业场景词库索引</div>
-            <div class="metric-bar"><span style="--fill: 86%"></span></div>
-            <p class="metric-note">位掩码多领域归属，支持热加载扩展</p>
+            <div class="metric-value"><span class="counter" data-target="73171" data-decimals="0">0</span><small>词</small></div>
+            <div class="metric-label">离线英文 &amp; 混输纠错词库</div>
+            <div class="metric-bar"><span style="--fill: 90%"></span></div>
+            <p class="metric-note">叠加 50,851 条 8 大专业场景词库热加载</p>
           </div>
           <div class="metric-card" data-reveal style="--stagger: 5">
-            <div class="metric-value"><span class="counter" data-target="76" data-decimals="0">0</span><small>/ 76</small></div>
+            <div class="metric-value"><span class="counter" data-target="105" data-decimals="0">0</span><small>/ 105</small></div>
             <div class="metric-label">自动化单元测试全绿</div>
             <div class="metric-bar"><span style="--fill: 100%"></span></div>
-            <p class="metric-note">25 个 Mach-O 二进制 0 外部路径泄漏</p>
+            <p class="metric-note">@rpath 闭环校验与 0 外部路径泄漏</p>
           </div>
         </div>
       </div>
@@ -504,29 +513,29 @@
             <p>干脆切换中文拼音与英文直出，长按组合键不误触。</p>
           </div>
           <div class="shortcut-card" data-reveal style="--stagger: 1">
-            <div class="keycap-row"><kbd class="keycap">右 ⌥</kbd><span class="key-plus">/</span><kbd class="keycap">×2</kbd></div>
-            <h4>单击开翻译 · 双击选语种</h4>
-            <p>空态 0ms 开关翻译模式；双击弹出 1–6 语种直选胶囊条。</p>
+            <div class="keycap-row"><kbd class="keycap">gitdiz</kbd><span class="key-plus">/</span><kbd class="keycap">Tab</kbd></div>
+            <h4>免切中英混输 &amp; 英文纠错</h4>
+            <p>直打 <code>gitdiz → git地址</code>、<code>dokcer → Docker</code>；临时英文下按 <code>Tab</code> 一键纠错，按 <code>Space</code> 保留原词。</p>
           </div>
           <div class="shortcut-card" data-reveal style="--stagger: 2">
-            <div class="keycap-row"><kbd class="keycap">1</kbd><kbd class="keycap">2</kbd><kbd class="keycap">3</kbd><span class="key-plus">/</span><kbd class="keycap">Tab</kbd></div>
-            <h4>单手采纳联想续写</h4>
-            <p>上屏后直接按数字键或 Tab 续写，或继续打拼音首字母 0ms 置顶。</p>
+            <div class="keycap-row"><kbd class="keycap">⌃</kbd><kbd class="keycap">⌥</kbd><kbd class="keycap">D</kbd><span class="key-plus">/</span><kbd class="keycap">/d</kbd></div>
+            <h4>整句暂存两段空格校对</h4>
+            <p>首空格送入草稿由 L1+L2 五重护栏自动纠错，再按空格整句上屏；<code>⌥⌫</code> 整段撤回。</p>
           </div>
           <div class="shortcut-card" data-reveal style="--stagger: 3">
-            <div class="keycap-row"><kbd class="keycap">⇧</kbd><span class="key-plus">+</span><kbd class="keycap wide">↩ Return</kbd></div>
-            <h4>单句临时译成英文</h4>
-            <p>无需切换翻译模式，普通中文状态下直接把当前句译成英文上屏。</p>
+            <div class="keycap-row"><kbd class="keycap">右 ⌥</kbd><span class="key-plus">/</span><kbd class="keycap">×2</kbd></div>
+            <h4>单击开翻译 · 双击选语种</h4>
+            <p>空态 0ms 开关翻译模式；双击弹出 1–6 语种直选胶囊条（<code>⌃⌥T</code> 全局一键关闭）。</p>
           </div>
           <div class="shortcut-card" data-reveal style="--stagger: 4">
-            <div class="keycap-row"><kbd class="keycap">⌃</kbd><kbd class="keycap">⌥</kbd><kbd class="keycap">T</kbd></div>
-            <h4>全局一键关闭翻译</h4>
-            <p>无论当前是否处于拼写态，随时一键回到纯中文输入。</p>
+            <div class="keycap-row"><kbd class="keycap">1</kbd><kbd class="keycap">2</kbd><kbd class="keycap">3</kbd><span class="key-plus">/</span><kbd class="keycap">⌥C</kbd></div>
+            <h4>单手联想续写 &amp; 单字逐选</h4>
+            <p>上屏后按数字键或 <code>Tab</code> 采纳双语联想续写；超长无候选自动进入或按 <code>⌥C</code> 切换单字逐选。</p>
           </div>
           <div class="shortcut-card" data-reveal style="--stagger: 5">
-            <div class="keycap-row"><kbd class="keycap">/ja</kbd><kbd class="keycap">/en</kbd><kbd class="keycap">/code</kbd></div>
-            <h4>行内指令免切菜单</h4>
-            <p>行内临时切换目标语种或中英文代码标点风格。</p>
+            <div class="keycap-row"><kbd class="keycap">⇧↩</kbd><kbd class="keycap">/ja</kbd><kbd class="keycap">/code</kbd></div>
+            <h4>单句译英 &amp; 行内指令</h4>
+            <p><code>Shift + Return</code> 单句临时译英；行内输入 <code>/ja</code>、<code>/en</code>、<code>/d</code>、<code>/code</code> 免切菜单。</p>
           </div>
         </div>
       </div>
@@ -547,9 +556,9 @@
             <h3>离线完整版 (Full Bundle)</h3>
             <p class="dl-desc">内置 <code>librime</code>、万象核心词库与语法模型，以及 <code>Qwen3-0.6B</code> + <code>HY-MT1.5-1.8B</code> 两枚本地 GGUF 模型。</p>
             <ul class="dl-list">
-              <li>提供图形向导 <code>.dmg</code> 与标准系统 <code>.pkg</code></li>
-              <li>约 1.8 GB，安装完成即享全部端侧 AI 能力</li>
-              <li>覆盖升级自动保留目录 inode 与辅助功能权限</li>
+              <li>提供图形向导 <code>.dmg</code> 与标准系统 <code>.pkg</code>（暂存自动清理零双份占用）</li>
+              <li>约 1.8 GB，安装完成即享全部端侧 AI 与整句校对能力</li>
+              <li>覆盖升级自动保留目录 inode 与辅助功能 TCC 权限</li>
             </ul>
             <a class="btn btn-primary btn-full" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">前往 GitHub Releases 下载完整版 →</a>
           </div>
@@ -557,11 +566,11 @@
           <div class="dl-card" data-reveal style="--stagger: 1">
             <div class="dl-ribbon subtle">轻量 · 模型按需拉取</div>
             <h3>轻量按需版 (Lite Bundle)</h3>
-            <p class="dl-desc">内置完整 L1 极速拼音底座、自动纠错与诗词/场景知识库；AI 模型可在安装向导中按需一键拉取或导入。</p>
+            <p class="dl-desc">内置完整 L1 极速拼音底座、7.3 万离线英文词库、自动纠错与诗词/场景知识库；AI 模型可在安装向导中按需一键拉取。</p>
             <ul class="dl-list">
               <li>体积仅约 373 MB，下载飞快</li>
-              <li>内置 ModelScope / HuggingFace 双镜像自动导入</li>
-              <li>同样支持 6 步零残留「卸载自己」</li>
+              <li>ModelScope / HuggingFace 双镜像导入，免重启即刻生效</li>
+              <li>单次提权防损回滚 6 步零残留「卸载自己」</li>
             </ul>
             <a class="btn btn-secondary btn-full" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">前往 GitHub Releases 下载轻量版 →</a>
           </div>

@@ -16,7 +16,11 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --sign-identity)
-      SIGN_ARGS+=(--sign-identity "${2:-}")
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'ERROR: --sign-identity requires a non-empty value.\n' >&2
+        exit 2
+      fi
+      SIGN_ARGS+=(--sign-identity "$2")
       shift 2
       ;;
     *)
@@ -26,7 +30,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-"$ROOT_DIR/Scripts/package-installer.sh" --format dmg --no-bundle-models "${SIGN_ARGS[@]}"
+"$ROOT_DIR/Scripts/package-installer.sh" --format app --no-bundle-models "${SIGN_ARGS[@]}"
 
 STAGE="$ROOT_DIR/build/package-stage"
 if [ "$DO_INSTALL" -eq 0 ]; then
@@ -52,6 +56,7 @@ if [ -x "$LSREG" ]; then
 fi
 
 pkill -x SmartPinyinInference 2>/dev/null || true
+pkill -x SmartPinyinSetup 2>/dev/null || true
 pkill -x SmartPinyin 2>/dev/null || true
 sleep 1.0
 open -g "$DEST_IME"

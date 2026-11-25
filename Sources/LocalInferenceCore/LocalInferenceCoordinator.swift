@@ -40,6 +40,8 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
     private let cache = TranslationLRUCache(capacity: 256)
     private let rerankCache = RerankLRUCache(capacity: 64)
     private let predictionCache = PredictionLRUCache(capacity: 128)
+    private let proofreadCache = ProofreadLRUCache(capacity: 128)
+    private let neuralProofreader = DraftNeuralProofreader()
     private let workerQueue = DispatchQueue(label: "com.smartpinyin.inference.worker", qos: .userInteractive)
     private let stateLock = NSLock()
 
@@ -87,18 +89,18 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
         if cancelledRequestIDs.count > 64 {
             cancelledRequestIDs.removeFirst(cancelledRequestIDs.count - 64)
         }
-        let shouldCancel = (activeRequestID == requestID)
-        let handle = activeHandle
-        stateLock.unlock()
-        if shouldCancel, let handle {
+        // 在 stateLock 持有期间执行无锁原子取消，彻底杜绝解锁后 workerQueue 并发 unloadActiveLocked() 销毁 handle 引发 UAF
+        if activeRequestID == requestID, let handle = activeHandle {
             spm_llama_request_cancel(handle)
         }
+        stateLock.unlock()
     }
 
     public func clearTranslationCache() {
         cache.clear()
         rerankCache.clear()
         predictionCache.clear()
+        proofreadCache.clear()
     }
 
     public func clearRerankCache() {
@@ -592,6 +594,116 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
         return true
     }
 
+    // MARK: - 4. 整句暂存错别字语义校对 (L2, 复用 .light 槽 Qwen3-0.6B，0 额外模型内存)
+
+    public func proofreadSentence(
+        sourceText: String,
+        leftContext: String,
+        requestID: String,
+        completion: @escaping @Sendable (ProofreadReplyPayload?) -> Void
+    ) {
+        workerQueue.async {
+            if self.consumeCancelled(requestID) {
+                completion(nil)
+                return
+            }
+            let payload = self.proofreadSentenceSync(
+                sourceText: sourceText,
+                leftContext: leftContext,
+                requestID: requestID
+            )
+            completion(payload)
+        }
+    }
+
+    public func proofreadSentenceSync(
+        sourceText: String,
+        leftContext: String = "",
+        requestID: String = UUID().uuidString,
+        bypassCache: Bool = false
+    ) -> ProofreadReplyPayload? {
+        let trimmed = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 4 else { return nil }
+        if consumeCancelled(requestID) { return nil }
+
+        if !bypassCache, let cached = proofreadCache.get(source: trimmed) {
+            return ProofreadReplyPayload(
+                correctedText: cached,
+                hasChanges: cached != trimmed,
+                latencyMs: 0.1,
+                fromCache: true,
+                backendName: "\(activeModelName) (cache)",
+                physicalFootprintMB: ProcessMemoryMonitor.physicalFootprintMB()
+            )
+        }
+
+        // 整句校对与翻译模式互斥，仅在用户主动处于草稿校对模式时调用；
+        // 若先前翻译留下了 .translation 槽，此处应按档位 C 互斥卸载并切回 .light（~135ms 一次），
+        // 绝不因翻译槽驻留而让整句校对在空闲卸载前（默认 3 分钟）完全失效。
+        guard let handle = activateSlotLocked(.light) else { return nil }
+        if consumeCancelled(requestID) { return nil }
+
+        beginRequest(requestID, handle: handle)
+        defer { endRequest(requestID) }
+        if consumeCancelled(requestID) { return nil }
+
+        // 使用「易混字定位 + 单次前向高惊讶度同音探测 + 精确联合对数似然裁决」替代 0.6B 生成式 Prompt：
+        // 零幻觉、零长度漂移、不漏纠句首易混字（「再上海→在上海」），且耗时仅 ~25–60ms
+        _ = leftContext
+        guard let outcome = neuralProofreader.proofread(
+            handle: handle,
+            sourceText: trimmed,
+            timeoutMs: 260
+        ) else {
+            return nil
+        }
+        if consumeCancelled(requestID) { return nil }
+
+        let cleaned = outcome.correctedText
+        guard !cleaned.isEmpty else { return nil }
+
+        // 仅当校对完整跑完、未被取消且未因超时截断时才写入缓存，严防脏结果污染 LRU
+        if outcome.isComplete {
+            proofreadCache.set(source: trimmed, corrected: cleaned)
+        }
+        return ProofreadReplyPayload(
+            correctedText: cleaned,
+            hasChanges: cleaned != trimmed,
+            latencyMs: outcome.latencyMs,
+            fromCache: false,
+            backendName: activeModelName,
+            physicalFootprintMB: ProcessMemoryMonitor.physicalFootprintMB()
+        )
+    }
+
+    /// 供校对与基准探针使用的精确联合对数似然批量打分（复用 .light 槽 Qwen3-0.6B）
+    public func scoreExactTextsSync(
+        sharedPrefix: String = "",
+        candidates: [String],
+        timeoutMs: Int = 250
+    ) -> (scores: [Double], latencyMs: Double)? {
+        guard candidates.count >= 2 else { return nil }
+        return workerQueue.sync {
+            guard let handle = self.activateSlotLocked(.light) else { return nil }
+            spm_llama_clear_cancel(handle)
+            var scores = [Double](repeating: -1e9, count: candidates.count)
+            var elapsed: Double = 0
+            let ok = self.withCStringArray(candidates) { cPtrs in
+                spm_llama_score_texts_exact(
+                    handle,
+                    sharedPrefix,
+                    cPtrs,
+                    Int32(candidates.count),
+                    Int32(timeoutMs),
+                    &scores,
+                    &elapsed
+                )
+            }
+            guard ok else { return nil }
+            return (scores, elapsed)
+        }
+    }
+
     // MARK: - 档位 C 互斥加载与空闲回收闸门
 
     private func activateSlotLocked(_ slot: ModelSlot) -> OpaquePointer? {
@@ -607,7 +719,7 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
         // 互斥策略：切换槽位前强制卸载旧模型，确保物理内存始终低于 2GB
         unloadActiveLocked()
 
-        let path: String
+        var path: String
         switch slot {
         case .none:
             return nil
@@ -615,6 +727,12 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
             path = config.lightModelPath
         case .translation:
             path = config.translationModelPath
+        }
+
+        // 轻量安装包先启输入法、后下载/导入模型时，动态重探一次标准模型目录，无需重启 XPC 进程即可即刻生效
+        if !FileManager.default.fileExists(atPath: path), config.autoRediscoverMissingModels {
+            let refreshed = InferenceBudgetConfig.defaultConfig()
+            path = (slot == .light) ? refreshed.lightModelPath : refreshed.translationModelPath
         }
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -668,9 +786,14 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
 
     private func beginRequest(_ id: String, handle: OpaquePointer) {
         stateLock.lock()
+        let alreadyCancelled = cancelledRequestIDs.contains(id)
         activeRequestID = id
+        if alreadyCancelled {
+            spm_llama_request_cancel(handle)
+        } else {
+            spm_llama_clear_cancel(handle)
+        }
         stateLock.unlock()
-        spm_llama_clear_cancel(handle)
     }
 
     private func endRequest(_ id: String) {
@@ -737,5 +860,48 @@ public final class LocalInferenceCoordinator: @unchecked Sendable {
         return constPtrs.withUnsafeBufferPointer { buf in
             body(buf.baseAddress!)
         }
+    }
+}
+
+private final class ProofreadLRUCache: @unchecked Sendable {
+    private let capacity: Int
+    private let lock = NSLock()
+    private var storage: [String: String] = [:]
+    private var order: [String] = []
+
+    init(capacity: Int) {
+        self.capacity = max(16, capacity)
+    }
+
+    func get(source: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let value = storage[source] else { return nil }
+        if let idx = order.firstIndex(of: source) {
+            order.remove(at: idx)
+            order.append(source)
+        }
+        return value
+    }
+
+    func set(source: String, corrected: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage[source] = corrected
+        if let idx = order.firstIndex(of: source) {
+            order.remove(at: idx)
+        }
+        order.append(source)
+        while order.count > capacity {
+            let oldest = order.removeFirst()
+            storage.removeValue(forKey: oldest)
+        }
+    }
+
+    func clear() {
+        lock.lock()
+        storage.removeAll()
+        order.removeAll()
+        lock.unlock()
     }
 }

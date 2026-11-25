@@ -1,4 +1,5 @@
 import Foundation
+import LocalInferenceCore
 import SmartPinyinInstallerCore
 import XCTest
 
@@ -206,5 +207,136 @@ final class InstallerEngineTests: XCTestCase {
             exp.fulfill()
         }
         wait(for: [exp], timeout: 5.0)
+    }
+
+    /// 回归测试：Lite 安装包在模型尚未下载时，InferenceBudgetConfig 必须回落至 Application Support 目录并开启自动重探，
+    /// 绝不能固化到只读 XPC Bundle 路径导致下载模型后仍无法加载。
+    func testDefaultInferenceBudgetConfigFallsBackToAppSupportAndEnablesRediscovery() throws {
+        let fm = FileManager.default
+        let tmpModels = fm.temporaryDirectory.appendingPathComponent("SmartPinyinEmptyModels_\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tmpModels) }
+        try fm.createDirectory(at: tmpModels, withIntermediateDirectories: true)
+
+        let cfg = InferenceBudgetConfig.defaultConfig(
+            projectModelsDir: nil,
+            appSupportModelsDir: tmpModels.path,
+            workingDirectory: tmpModels.path
+        )
+        XCTAssertTrue(cfg.autoRediscoverMissingModels)
+        XCTAssertEqual(cfg.lightModelPath, tmpModels.appendingPathComponent("Qwen3-0.6B-Q4_K_M.gguf").path)
+        XCTAssertEqual(cfg.translationModelPath, tmpModels.appendingPathComponent("HY-MT1.5-1.8B-Q4_K_M.gguf").path)
+    }
+
+    /// 回归测试：PermissionChecker 对指定已安装 SmartPinyin.app 严格以子进程探针退出码为准，绝不回落至 Setup App 产生假阳性绿勾
+    func testPermissionCheckerRespectsInstalledAppProbeResultWithoutFalsePositiveFallback() throws {
+        let fm = FileManager.default
+        let tmpApp = fm.temporaryDirectory.appendingPathComponent("FakeSmartPinyin_\(UUID().uuidString).app", isDirectory: true)
+        defer { try? fm.removeItem(at: tmpApp) }
+        let exe = tmpApp.appendingPathComponent("Contents/MacOS/SmartPinyin")
+        try fm.createDirectory(at: exe.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        try "#!/bin/sh\nexit 1\n".write(to: exe, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+        XCTAssertFalse(PermissionChecker.isAccessibilityTrusted(installedAppURL: tmpApp))
+
+        try "#!/bin/sh\nexit 0\n".write(to: exe, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+        XCTAssertTrue(PermissionChecker.isAccessibilityTrusted(installedAppURL: tmpApp))
+    }
+
+    /// 回归测试：系统级路径优先排在 inspectDiskUsage 首位；特权自删脚本同步清理 IntlDataCache 且通过 sh -n；白名单放行 BundledModels 暂存目录
+    func testSystemScopeOrderingAndPrivilegedSelfDeleteScriptValidity() throws {
+        let fm = FileManager.default
+        let sandbox = fm.temporaryDirectory.appendingPathComponent("SmartPinyinScopeOrder_\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: sandbox) }
+
+        let fakeHome = sandbox.appendingPathComponent("Home", isDirectory: true)
+        let fakeSysIME = sandbox.appendingPathComponent("SysIME", isDirectory: true)
+        let fakeSysApps = sandbox.appendingPathComponent("SysApps", isDirectory: true)
+        try fm.createDirectory(at: fakeHome.appendingPathComponent("Library/Input Methods/SmartPinyin.app"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fakeSysIME.appendingPathComponent("SmartPinyin.app"), withIntermediateDirectories: true)
+
+        let engine = InstallerEngine(
+            homeDirectory: fakeHome,
+            systemInputMethodsDirectory: fakeSysIME,
+            systemApplicationsDirectory: fakeSysApps,
+            sandboxRootForValidation: fakeHome,
+            skipSystemIntegration: true
+        )
+
+        let usage = engine.inspectDiskUsage()
+        XCTAssertEqual(usage.installedAppPaths.count, 2)
+        XCTAssertEqual(
+            usage.installedAppPaths.first?.standardizedFileURL,
+            engine.systemInputMethodURL.standardizedFileURL,
+            "存在双副本时应优先以系统级 SmartPinyin.app 为主路径"
+        )
+        XCTAssertTrue(engine.validator.isAllowedToDelete(URL(fileURLWithPath: "/Library/Application Support/SmartPinyin/BundledModels")))
+        XCTAssertTrue(engine.validator.isAllowedToDelete(fakeHome.appendingPathComponent("Library/Caches/com.smartpinyin.inputmethod.SmartPinyin.Setup")))
+        XCTAssertTrue(engine.validator.isAllowedToDelete(fakeHome.appendingPathComponent("Library/HTTPStorages/com.smartpinyin.inputmethod.SmartPinyin.Setup")))
+
+        let scriptURL = try engine.createSelfDeleteScript(
+            targets: [
+                URL(fileURLWithPath: "/Applications/SmartPinyin Setup.app"),
+                URL(fileURLWithPath: "/Library/Input Methods/SmartPinyin.app")
+            ],
+            requiresAdmin: true
+        )
+        defer { try? fm.removeItem(at: scriptURL) }
+        let content = try String(contentsOf: scriptURL, encoding: .utf8)
+        XCTAssertTrue(content.contains("com.apple.IntlDataCache*"), "特权自删脚本应同步清理系统级 IntlDataCache")
+        XCTAssertTrue(content.contains("/Applications/SmartPinyin Setup.app"))
+        XCTAssertTrue(content.contains("/Library/Input Methods/SmartPinyin.app"))
+
+        let checkProc = Process()
+        checkProc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        checkProc.arguments = ["-n", scriptURL.path]
+        try checkProc.run()
+        checkProc.waitUntilExit()
+        XCTAssertEqual(checkProc.terminationStatus, 0)
+    }
+
+    /// 回归测试：卸载必须同步清理 Setup 缓存与 HTTPStorages，且 Logs 计入 preferencesAndLogsBytes 而非 userDictionaryBytes
+    func testUninstallRemovesSetupCachesAndHTTPStoragesWithAccurateDiskAccounting() throws {
+        let fm = FileManager.default
+        let sandbox = fm.temporaryDirectory.appendingPathComponent("SmartPinyinUninstallAudit_\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: sandbox) }
+
+        let fakeHome = sandbox.appendingPathComponent("Home", isDirectory: true)
+        let engine = InstallerEngine(
+            homeDirectory: fakeHome,
+            systemInputMethodsDirectory: sandbox.appendingPathComponent("SysIME", isDirectory: true),
+            systemApplicationsDirectory: sandbox.appendingPathComponent("SysApps", isDirectory: true),
+            sandboxRootForValidation: fakeHome,
+            skipSystemIntegration: true
+        )
+
+        let logsDir = engine.appSupportDirectory.appendingPathComponent("Logs", isDirectory: true)
+        let setupCacheDir = fakeHome.appendingPathComponent("Library/Caches/com.smartpinyin.inputmethod.SmartPinyin.Setup", isDirectory: true)
+        let httpStorageDir = fakeHome.appendingPathComponent("Library/HTTPStorages/com.smartpinyin.inputmethod.SmartPinyin.Setup", isDirectory: true)
+        try fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: setupCacheDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: httpStorageDir, withIntermediateDirectories: true)
+        try Data(repeating: 0x11, count: 4096).write(to: logsDir.appendingPathComponent("rime.log"))
+        try Data(repeating: 0x22, count: 2048).write(to: setupCacheDir.appendingPathComponent("Cache.db"))
+        try Data(repeating: 0x33, count: 1024).write(to: httpStorageDir.appendingPathComponent("httpstorages.sqlite"))
+
+        let usage = engine.inspectDiskUsage()
+        XCTAssertEqual(usage.userDictionaryBytes, 0, "Logs 绝不应被误计入个人词库大小")
+        XCTAssertGreaterThanOrEqual(usage.preferencesAndLogsBytes, 7168)
+
+        let result = try engine.uninstall(
+            options: UninstallOptions(
+                removeUserDictionaries: false,
+                removeLocalModels: false,
+                removePreferencesAndLogs: true
+            ),
+            currentProcessBundleURL: nil,
+            launchDeferredScript: false
+        )
+        XCTAssertFalse(result.shouldTerminateAfterUninstall)
+        XCTAssertFalse(fm.fileExists(atPath: logsDir.path))
+        XCTAssertFalse(fm.fileExists(atPath: setupCacheDir.path))
+        XCTAssertFalse(fm.fileExists(atPath: httpStorageDir.path))
     }
 }

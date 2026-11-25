@@ -62,9 +62,9 @@ validate_gguf() {
   local size
   size="$(stat -f '%z' "$file" 2>/dev/null || stat -c '%s' "$file")"
   [ "$size" -ge "$min_bytes" ] || return 1
-  local magic
-  magic="$(head -c 4 "$file" | tr -dc 'A-Z')"
-  [ "$magic" = "GGUF" ]
+  local magic_hex
+  magic_hex="$(od -An -tx1 -N4 "$file" | tr -d ' \t\r\n')"
+  [ "$magic_hex" = "47475546" ]
 }
 
 # 1. librime 1.17.0

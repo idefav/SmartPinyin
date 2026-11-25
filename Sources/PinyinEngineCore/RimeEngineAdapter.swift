@@ -174,6 +174,29 @@ public final class RimeEngineAdapter: PinyinEngineProtocol {
         return out
     }
 
+    public func probeSingleChars(forSyllable syllable: String, limit: Int = 63) -> [PinyinCandidate] {
+        let clean = syllable.lowercased().filter { $0 >= "a" && $0 <= "z" }
+        guard !clean.isEmpty, limit > 0 else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return [] }
+        var outCount: Int32 = 0
+        guard let ptr = spm_rime_probe_single_chars(h, clean, Int32(limit), &outCount), outCount > 0 else {
+            return []
+        }
+        defer { spm_rime_free_candidates(ptr, outCount) }
+        var out: [PinyinCandidate] = []
+        out.reserveCapacity(Int(outCount))
+        for i in 0..<Int(outCount) {
+            let item = ptr[i]
+            let text = item.text.map { String(cString: $0) } ?? ""
+            guard !text.isEmpty else { continue }
+            let comment = item.comment.map { String(cString: $0) }
+            out.append(PinyinCandidate(index: i, text: text, comment: comment, source: .rime))
+        }
+        return out
+    }
+
     /// 实时应用用户常用配置（开关项零延迟立即生效，每页候选数/模糊音变更时同步更新 YAML 并热重载会话）
     public func applyPreferences(_ prefs: SmartPinyinPreferences) {
         var needsReload = false
@@ -389,6 +412,7 @@ public final class RimeEngineAdapter: PinyinEngineProtocol {
           translator/encode_commit_history: true
           translator/contextual_suggestions: true
           translator/enable_correction: false
+          super_processor/limit_repeated: "8,80"
           menu/page_size: \(clamped)\(algebraBlock)
         """
         if (try? String(contentsOf: schemaCustomURL, encoding: .utf8)) != schemaPatch {

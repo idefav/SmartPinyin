@@ -91,6 +91,48 @@ bool spm_llama_score_candidates(
     double* elapsed_ms_out
 );
 
+/// 精确联合对数似然打分（专用于整句错别字/易混字校对判别，不做 token 长度均分归一化）：
+/// 使用自然用户输入语境头（<|im_start|>user\n）+ shared_prefix 仅 Prefill 一次并复用 KV，
+/// 逐候选计算精确整串联合对数概率 ∑ log P(tok_k | prefix, tok_<k)，消除 BPE 合并/拆分 token 数差异偏差。
+/// scores_out 长度须 >= num_candidates；超时（timeout_ms > 0）或被取消时返回 false。
+bool spm_llama_score_texts_exact(
+    SPMLlamaEngine* engine,
+    const char* shared_prefix,
+    const char* const* candidates,
+    int32_t num_candidates,
+    int32_t timeout_ms,
+    double* scores_out,
+    double* elapsed_ms_out
+);
+
+typedef struct SPMLlamaTokenProposal {
+    int32_t byte_offset;   // 原 token 在 text 中的 UTF-8 起始字节偏移
+    int32_t byte_length;   // 原 token 在 text 中的 UTF-8 字节长度
+    double token_logprob;  // 原 token 在该位置的条件对数概率
+    char** alt_texts;      // Top-K 高概率纯汉字替换候选片段（1~3 汉字）
+    double* alt_logprobs;  // 对应条件对数概率
+    int32_t alt_count;
+} SPMLlamaTokenProposal;
+
+typedef struct SPMLlamaSurprisalResult {
+    SPMLlamaTokenProposal* items;
+    int32_t count;
+    double total_ms;
+    bool cancelled;
+    bool ok;
+} SPMLlamaSurprisalResult;
+
+/// 单次前向扫描整句中的异常低概率（高惊讶度）位置，并提取 Top-K 纯汉字替换候选（零生成、零幻觉）
+SPMLlamaSurprisalResult spm_llama_probe_surprisal_proposals(
+    SPMLlamaEngine* engine,
+    const char* text,
+    double surprisal_threshold,
+    int32_t top_k,
+    int32_t timeout_ms
+);
+
+void spm_llama_free_surprisal_result(SPMLlamaSurprisalResult* result);
+
 /// 共享 KV 前缀原生多分支续写：
 /// 仅对纯净上文 raw_prefix 做一次 Prefill，从末位 logits 选出 Top-K 合法词首 token，
 /// 复用前缀 KV Cache 各自独立贪心短展开至自然语义边界，彻底消除 Chat 指令串行吐多行的跨行污染。

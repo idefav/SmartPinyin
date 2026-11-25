@@ -87,6 +87,25 @@ final class InferenceServiceHandler: NSObject, InferenceXPCProtocol {
         }
     }
 
+    func proofreadSentence(
+        sourceText: String,
+        leftContext: String,
+        requestID: String,
+        withReply reply: @escaping (Data?) -> Void
+    ) {
+        coordinator.proofreadSentence(
+            sourceText: sourceText,
+            leftContext: leftContext,
+            requestID: requestID
+        ) { payload in
+            guard let payload, let encoded = try? JSONEncoder().encode(payload) else {
+                reply(nil)
+                return
+            }
+            reply(encoded)
+        }
+    }
+
     func cancelRequest(requestID: String) {
         coordinator.cancel(requestID: requestID)
     }

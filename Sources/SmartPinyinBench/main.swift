@@ -2,9 +2,128 @@ import Foundation
 import LocalInferenceCore
 import PinyinEngineCore
 import SharedIPC
+import SmartPinyinCore
 
 struct BenchmarkRunner {
+    static func runProofreadProbe() {
+        let cwd = FileManager.default.currentDirectoryPath
+        let config = InferenceBudgetConfig.defaultConfig(projectModelsDir: cwd + "/Models")
+        let coordinator = LocalInferenceCoordinator(config: config)
+        let ruleEngine = DraftProofreadEngine()
+        let load = coordinator.ensureSlotLoadedSync(.light)
+        print(String(format: "[Probe] Loaded Qwen3-0.6B in %.1f ms | phys=%.1f MB", load.loadMs, load.physicalFootprintMB))
+
+        // 预热 Metal pipeline
+        _ = coordinator.proofreadSentenceSync(sourceText: "今天天气不错", bypassCache: true)
+
+        let positiveCases: [(src: String, expected: String)] = [
+            ("再上海可以有哪些地方可以去", "在上海可以有哪些地方可以去"),
+            ("再北京有哪些好玩的地方", "在北京有哪些好玩的地方"),
+            ("你再哪里工作", "你在哪里工作"),
+            ("在来一次吧", "再来一次吧"),
+            ("麻烦你在说一遍", "麻烦你再说一遍"),
+            ("他跑的很快", "他跑得很快"),
+            ("请问你去那里玩", "请问你去哪里玩"),
+            ("这个功能做为默认选项", "这个功能作为默认选项"),
+            ("周末去公园完", "周末去公园玩"),
+            ("我门明天一起吃饭", "我们明天一起吃饭"),
+            ("已后有空再约", "以后有空再约"),
+            ("这件事以经完成了", "这件事已经完成了"),
+            ("我今天去吃反了", "我今天去吃饭了"),
+            ("我想买一台电恼", "我想买一台电脑"),
+            ("这个坐位有人吗", "这个座位有人吗"),
+            ("再上海有那些地方可以完", "在上海有哪些地方可以玩"),
+            ("请把文见发给我", "请把文件发给我"),
+            ("大家周末一起去公原散步", "大家周末一起去公园散步"),
+            ("用 React 写了一个新防案", "用 React 写了一个新方案"),
+            ("帮我查一下微心消息", "帮我查一下微信消息"),
+            ("买一杯冰美式咖飞", "买一杯冰美式咖啡"),
+            ("今天忘记带手鸡出门了", "今天忘记带手机出门了"),
+            ("好把那就这样定了", "好吧那就这样定了"),
+            ("我自已去处理这件事", "我自己去处理这件事"),
+            ("我昨天去上孩完了一天", "我昨天去上海玩了一天")
+        ]
+
+        let negativeCases: [String] = [
+            "今天天气真不错，我们明天再去上海",
+            "他在上海工作很多年了",
+            "请慢慢地走不要着急",
+            "你先回去再看看",
+            "我昨天去过那里",
+            "我回家做饭去了",
+            "作业已经做完了",
+            "这是一个很好的方案",
+            "他在外面等你呢",
+            "我再也不想去了",
+            "下周再去一次上海",
+            "出门记得带钥匙",
+            "大家请坐下休息",
+            "他今天没带眼镜",
+            "找张伟聊一下这个需求",
+            "用 Swift 写了一段缓存逻辑",
+            "帮我把 PR 合并一下吧",
+            "排查 Redis 连接池超时问题",
+            "先这样吧以后再联系",
+            "我觉得这个设计非常清晰",
+            "请画一条实线不要压实线",
+            "楼上孩子很吵，他在做业务",
+            "数据来自已经发布的版本"
+        ]
+
+        print("\n=== [1] POSITIVE TYPO RECALL (\(positiveCases.count) real cases, L1→L2 chained) ===")
+        var posHit = 0
+        var latencies: [Double] = []
+        for tc in positiveCases {
+            let l1 = ruleEngine.applyRuleProofread(to: tc.src)
+            let aiInput = l1.hasChanges ? l1.correctedText : tc.src
+            if let r = coordinator.proofreadSentenceSync(sourceText: aiInput, bypassCache: true) {
+                latencies.append(r.latencyMs)
+                let finalText = r.correctedText
+                let ok = (finalText == tc.expected)
+                if ok { posHit += 1 }
+                print(String(format: "  [%@] %@ -> %@ (exp: %@ | %.1f ms%@)",
+                             ok ? "PASS" : "MISS", tc.src, finalText, tc.expected, r.latencyMs,
+                             l1.hasChanges ? " | L1+L2" : " | L2"))
+            }
+        }
+
+        print("\n=== [2] NEGATIVE FALSE-POSITIVE CONTROL (\(negativeCases.count) clean cases, L1→L2 chained) ===")
+        var negPass = 0
+        for src in negativeCases {
+            let l1 = ruleEngine.applyRuleProofread(to: src)
+            let aiInput = l1.hasChanges ? l1.correctedText : src
+            if let r = coordinator.proofreadSentenceSync(sourceText: aiInput, bypassCache: true) {
+                latencies.append(r.latencyMs)
+                let ok = (r.correctedText == src)
+                if ok { negPass += 1 }
+                print(String(format: "  [%@] %@ -> %@ (%.1f ms)",
+                             ok ? "PASS" : "FP!!", src, r.correctedText, r.latencyMs))
+            }
+        }
+
+        let avgMs = latencies.isEmpty ? 0 : latencies.reduce(0, +) / Double(latencies.count)
+        let maxMs = latencies.max() ?? 0
+        print(String(format: "\nSUMMARY: Recall=%d/%d | CleanPrecision=%d/%d (FP=%d) | avg=%.1f ms | max=%.1f ms | phys=%.1f MB",
+                     posHit, positiveCases.count, negPass, negativeCases.count, negativeCases.count - negPass,
+                     avgMs, maxMs, ProcessMemoryMonitor.physicalFootprintMB()))
+
+        // 验证从 .translation 槽互斥切回 .light 槽做整句校对不会再被静默跳过
+        _ = coordinator.ensureSlotLoadedSync(.translation)
+        if let switched = coordinator.proofreadSentenceSync(sourceText: "再上海可以有哪些地方可以去", bypassCache: true) {
+            let ok = switched.correctedText == "在上海可以有哪些地方可以去"
+            print(String(format: "[SLOT-HANDOFF] [%@] translation->light proofread -> %@ (%.1f ms | phys=%.1f MB)",
+                         ok ? "PASS" : "FAIL", switched.correctedText, switched.latencyMs, switched.physicalFootprintMB))
+        } else {
+            print("[SLOT-HANDOFF] [FAIL] returned nil when translation slot was active!")
+        }
+        coordinator.unloadNow()
+    }
+
     static func run() {
+        if CommandLine.arguments.contains("--proofread-probe") {
+            runProofreadProbe()
+            return
+        }
         let cwd = FileManager.default.currentDirectoryPath
         let rimeDataDir = URL(fileURLWithPath: cwd).appendingPathComponent("Resources/RimeData")
         let reuseCache = CommandLine.arguments.contains("--reuse-rime-cache")

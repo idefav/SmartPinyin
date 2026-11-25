@@ -85,6 +85,7 @@ public struct CandidateFusionRanker: Sendable {
         excludedFirstPageTexts: Set<String> = [],
         pendingPredictions: [PendingPredictionCandidate] = [],
         typoCandidates: [TypoCorrectedCandidate] = [],
+        mixedBilingualCandidates: [MixedBilingualCandidate] = [],
         rawPinyin: String,
         leftContext: String,
         appBundleID: String,
@@ -302,6 +303,111 @@ public struct CandidateFusionRanker: Sendable {
                         originalRimeIndex: existing.originalRimeIndex,
                         globalRimeIndex: existing.globalRimeIndex,
                         correctedPinyin: corrPin,
+                        features: mergedFeatures,
+                        score: newScore
+                    )
+                }
+            }
+        }
+
+        // 1.85 融合中英文混输、离线英文词典补全与英文拼写纠错候选
+        var injectedMixedCount = 0
+        for mixed in mixedBilingualCandidates where injectedMixedCount < 3 {
+            let sigKey = mixed.canonicalKey.isEmpty ? rawPinyin : mixed.canonicalKey
+            let sig = lookupMemorySignals(
+                memoryStore: useMemory ? memoryStore : nil,
+                rawPinyin: sigKey,
+                word: mixed.text,
+                leftContext: leftContext,
+                appBundleID: appBundleID
+            )
+            let rawSig = (sigKey != rawPinyin)
+                ? lookupMemorySignals(
+                    memoryStore: useMemory ? memoryStore : nil,
+                    rawPinyin: rawPinyin,
+                    word: mixed.text,
+                    leftContext: leftContext,
+                    appBundleID: appBundleID
+                )
+                : (exactPref: 0.0, regret: 0.0, bigram: 0.0, appPref: 0.0)
+            let mergedExactPref = max(sig.exactPref, rawSig.exactPref)
+            let mergedRegret = min(sig.regret, rawSig.regret)
+            let mergedBigram = max(sig.bigram, rawSig.bigram)
+            let mergedAppPref = max(sig.appPref, rawSig.appPref)
+
+            let env = Self.contextEnvelope(
+                docHit: docByText[mixed.text],
+                workHit: workByText[mixed.text]
+            )
+            let sceneBoost: Double = (sceneState.primaryScene == .computerScience && preferences.enableSmartSceneAdaptation) ? 0.20 : 0.0
+            let rimeTopIsPureASCII = rimeCandidates.first.map {
+                !$0.text.isEmpty && $0.text.unicodeScalars.allSatisfy { $0.value < 128 }
+            } ?? false
+            let basePrior: Double
+            if mixed.isFragmentedSource {
+                if mixed.isSpellCorrected {
+                    basePrior = max(1.50, 2.74 - 0.26 * Double(mixed.rank) - 0.16 * min(2.0, mixed.editCost))
+                } else {
+                    basePrior = max(1.55, 2.75 - 0.28 * Double(mixed.rank))
+                }
+            } else if rimeTopIsPureASCII {
+                // Rime 首位已是纯英文（如 git / dock）：在保留首位的基础上把精选技术词（GitHub / Docker）提至前 2–3 位
+                basePrior = max(1.40, 2.22 - 0.14 * Double(mixed.rank))
+            } else {
+                // 原输入本身是合法纯中文整串（如 api / ai / apiwendang）：克制次选，绝不抢占高频纯中文第 1 位
+                basePrior = max(1.05, 1.88 - 0.30 * Double(mixed.rank))
+            }
+
+            let source: CandidateSource = mixed.isSpellCorrected ? .typoCorrected : .mixedBilingual
+            if seen.insert(mixed.text).inserted {
+                let features = CandidateFeatureVector(
+                    rimePrior: basePrior,
+                    exactPinyinPref: mergedExactPref,
+                    regretPenalty: mergedRegret,
+                    contextBigram: mergedBigram,
+                    appScenePref: mergedAppPref,
+                    docLexiconMatch: env.docLex,
+                    docContinuation: env.docCont,
+                    workingMemoryMatch: env.workLex,
+                    workingMemoryContinuation: env.workCont,
+                    domainSceneBoost: sceneBoost
+                )
+                items.append(RankedCandidateItem(
+                    candidate: PinyinCandidate(index: items.count, text: mixed.text, comment: nil, source: source),
+                    originalRimeIndex: nil,
+                    globalRimeIndex: nil,
+                    correctedPinyin: sigKey,
+                    features: features,
+                    score: weights.score(features)
+                ))
+                injectedMixedCount += 1
+            } else if let existingIdx = items.firstIndex(where: { $0.candidate.text == mixed.text }) {
+                let existing = items[existingIdx]
+                let mergedFeatures = CandidateFeatureVector(
+                    rimePrior: max(existing.features.rimePrior, basePrior),
+                    exactPinyinPref: max(existing.features.exactPinyinPref, mergedExactPref),
+                    regretPenalty: min(existing.features.regretPenalty, mergedRegret),
+                    contextBigram: max(existing.features.contextBigram, mergedBigram),
+                    appScenePref: max(existing.features.appScenePref, mergedAppPref),
+                    docLexiconMatch: max(existing.features.docLexiconMatch, env.docLex),
+                    docContinuation: max(existing.features.docContinuation, env.docCont),
+                    workingMemoryMatch: max(existing.features.workingMemoryMatch, env.workLex),
+                    workingMemoryContinuation: max(existing.features.workingMemoryContinuation, env.workCont),
+                    neuralContextScore: existing.features.neuralContextScore,
+                    domainSceneBoost: max(existing.features.domainSceneBoost, sceneBoost)
+                )
+                let newScore = weights.score(mergedFeatures)
+                if newScore > existing.score + 0.05 {
+                    items[existingIdx] = RankedCandidateItem(
+                        candidate: PinyinCandidate(
+                            index: existing.candidate.index,
+                            text: existing.candidate.text,
+                            comment: existing.candidate.comment,
+                            source: existing.candidate.source
+                        ),
+                        originalRimeIndex: existing.originalRimeIndex,
+                        globalRimeIndex: existing.globalRimeIndex,
+                        correctedPinyin: existing.correctedPinyin ?? sigKey,
                         features: mergedFeatures,
                         score: newScore
                     )

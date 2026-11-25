@@ -87,15 +87,24 @@ double log_prob_of_token(const float* logits, int32_t n_vocab, llama_token targe
     for (int32_t i = 1; i < n_vocab; ++i) {
         if (logits[i] > max_logit) max_logit = logits[i];
     }
+    // 跳过距最大 logit 超过 20.0 的极尾项（exp(-20) ≈ 2e-9，总误差 < 1e-4 nats），可省去 99%+ 的 exp() 计算
+    const float cutoff = max_logit - 20.0f;
     double sum_exp = 0.0;
     for (int32_t i = 0; i < n_vocab; ++i) {
-        sum_exp += std::exp(static_cast<double>(logits[i] - max_logit));
+        if (logits[i] > cutoff) {
+            sum_exp += std::exp(static_cast<double>(logits[i] - max_logit));
+        }
     }
     double log_z = static_cast<double>(max_logit) + std::log(sum_exp);
     return static_cast<double>(logits[target]) - log_z;
 }
 
 } // namespace
+
+struct PureCJKVocabEntry {
+    llama_token token;
+    std::string piece;
+};
 
 struct SPMLlamaEngine {
     llama_model* model = nullptr;
@@ -105,6 +114,8 @@ struct SPMLlamaEngine {
     int32_t n_batch = 128;
     std::atomic<bool> cancel_requested{false};
     std::mutex exec_mutex;
+    bool cjk_vocab_ready = false;
+    std::vector<PureCJKVocabEntry> pure_cjk_vocab;
 
     ~SPMLlamaEngine() {
         if (ctx) {
@@ -285,7 +296,10 @@ SPMLlamaGenResult spm_llama_generate(
     if (!engine || !engine->ctx || !engine->vocab || !prompt) return res;
 
     std::lock_guard<std::mutex> lock(engine->exec_mutex);
-    engine->cancel_requested.store(false, std::memory_order_release);
+    if (engine->cancel_requested.load(std::memory_order_acquire)) {
+        res.cancelled = true;
+        return res;
+    }
 
     auto t0 = Clock::now();
     llama_memory_clear(llama_get_memory(engine->ctx), true);
@@ -408,7 +422,10 @@ bool spm_llama_score_candidates(
     }
 
     std::lock_guard<std::mutex> lock(engine->exec_mutex);
-    engine->cancel_requested.store(false, std::memory_order_release);
+    if (engine->cancel_requested.load(std::memory_order_acquire)) {
+        if (elapsed_ms_out) *elapsed_ms_out = 0.0;
+        return false;
+    }
 
     auto t0 = Clock::now();
     llama_memory_t mem = llama_get_memory(engine->ctx);
@@ -506,6 +523,153 @@ bool spm_llama_score_candidates(
     }
 
     llama_batch_free(cand_batch);
+    if (elapsed_ms_out) *elapsed_ms_out = elapsed_ms(t0);
+    return !cancelled && scored_count >= 2;
+}
+
+bool spm_llama_score_texts_exact(
+    SPMLlamaEngine* engine,
+    const char* shared_prefix,
+    const char* const* candidates,
+    int32_t num_candidates,
+    int32_t timeout_ms,
+    double* scores_out,
+    double* elapsed_ms_out
+) {
+    if (!engine || !engine->ctx || !engine->vocab || !candidates || num_candidates <= 0 || !scores_out) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(engine->exec_mutex);
+    if (engine->cancel_requested.load(std::memory_order_acquire)) {
+        if (elapsed_ms_out) *elapsed_ms_out = 0.0;
+        return false;
+    }
+
+    auto t0 = Clock::now();
+    llama_memory_t mem = llama_get_memory(engine->ctx);
+    llama_memory_clear(mem, true);
+
+    const std::string prefix_str = shared_prefix ? std::string(shared_prefix) : std::string();
+    std::vector<llama_token> prefix_tokens;
+    const char* chat_tmpl = llama_model_chat_template(engine->model, nullptr);
+    if (chat_tmpl && std::strstr(chat_tmpl, "<|im_start|>") != nullptr) {
+        // 复用自然用户输入分布头（<|im_start|>user\n），同时天然支持 shared_prefix 为空时的句首字符打分
+        prefix_tokens = tokenize_string(engine->vocab, "<|im_start|>user\n", false, true);
+        if (!prefix_str.empty()) {
+            auto body = tokenize_string(engine->vocab, prefix_str, false, false);
+            prefix_tokens.insert(prefix_tokens.end(), body.begin(), body.end());
+        }
+    } else {
+        prefix_tokens = tokenize_string(engine->vocab, prefix_str, true, false);
+        if (prefix_tokens.empty()) {
+            llama_token bos = llama_vocab_bos(engine->vocab);
+            if (bos >= 0) prefix_tokens.push_back(bos);
+        }
+    }
+    if (prefix_tokens.empty()) return false;
+
+    const int32_t max_cand_tokens = std::min<int32_t>(engine->n_batch, 128);
+    const int32_t max_prefix = std::max<int32_t>(16, engine->n_ctx - max_cand_tokens - 4);
+    if (static_cast<int32_t>(prefix_tokens.size()) > max_prefix) {
+        prefix_tokens.erase(prefix_tokens.begin(), prefix_tokens.end() - max_prefix);
+    }
+
+    const int32_t prefix_len = static_cast<int32_t>(prefix_tokens.size());
+    int32_t pos = 0;
+    while (pos < prefix_len) {
+        if (engine->cancel_requested.load(std::memory_order_acquire)) {
+            if (elapsed_ms_out) *elapsed_ms_out = elapsed_ms(t0);
+            return false;
+        }
+        int32_t chunk = std::min(engine->n_batch, prefix_len - pos);
+        llama_batch batch = llama_batch_get_one(prefix_tokens.data() + pos, chunk);
+        if (llama_decode(engine->ctx, batch) != 0) {
+            if (elapsed_ms_out) *elapsed_ms_out = elapsed_ms(t0);
+            return false;
+        }
+        pos += chunk;
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(engine->vocab);
+    const float* prefix_last_logits = llama_get_logits_ith(engine->ctx, -1);
+    if (!prefix_last_logits || n_vocab <= 0) {
+        if (elapsed_ms_out) *elapsed_ms_out = elapsed_ms(t0);
+        return false;
+    }
+    std::vector<float> saved_prefix_logits(prefix_last_logits, prefix_last_logits + n_vocab);
+
+    struct ScopedLlamaBatch {
+        llama_batch batch;
+        explicit ScopedLlamaBatch(int32_t cap) : batch(llama_batch_init(cap, 0, 1)) {}
+        ~ScopedLlamaBatch() { llama_batch_free(batch); }
+        ScopedLlamaBatch(const ScopedLlamaBatch&) = delete;
+        ScopedLlamaBatch& operator=(const ScopedLlamaBatch&) = delete;
+    } scoped_batch(max_cand_tokens);
+
+    for (int32_t i = 0; i < num_candidates; ++i) {
+        scores_out[i] = -1e9;
+    }
+
+    bool cancelled = false;
+    int32_t scored_count = 0;
+    for (int32_t i = 0; i < num_candidates; ++i) {
+        if (engine->cancel_requested.load(std::memory_order_acquire)) {
+            cancelled = true;
+            break;
+        }
+        if (timeout_ms > 0 && elapsed_ms(t0) > static_cast<double>(timeout_ms)) {
+            break;
+        }
+
+        const char* cand_cstr = candidates[i];
+        std::vector<llama_token> ctoks = tokenize_string(
+            engine->vocab,
+            cand_cstr ? std::string(cand_cstr) : std::string(),
+            false,
+            false
+        );
+        if (ctoks.empty()) {
+            scores_out[i] = -1e6;
+            continue;
+        }
+
+        const int32_t avail_ctx = engine->n_ctx - prefix_len - 1;
+        const int32_t max_eval_tokens = std::min<int32_t>(max_cand_tokens, std::max<int32_t>(1, avail_ctx));
+        if (static_cast<int32_t>(ctoks.size()) > max_eval_tokens) {
+            ctoks.resize(static_cast<size_t>(max_eval_tokens));
+        }
+
+        double total_lp = log_prob_of_token(saved_prefix_logits.data(), n_vocab, ctoks[0]);
+
+        if (ctoks.size() > 1) {
+            llama_memory_seq_rm(mem, 0, prefix_len, -1);
+
+            const int32_t eval_n = static_cast<int32_t>(ctoks.size()) - 1;
+            scoped_batch.batch.n_tokens = eval_n;
+            for (int32_t k = 0; k < eval_n; ++k) {
+                scoped_batch.batch.token[k] = ctoks[static_cast<size_t>(k)];
+                scoped_batch.batch.pos[k] = prefix_len + k;
+                scoped_batch.batch.n_seq_id[k] = 1;
+                scoped_batch.batch.seq_id[k][0] = 0;
+                scoped_batch.batch.logits[k] = 1;
+            }
+
+            if (llama_decode(engine->ctx, scoped_batch.batch) != 0) {
+                scores_out[i] = -1e6;
+                continue;
+            }
+            for (int32_t k = 0; k < eval_n; ++k) {
+                const float* step_logits = llama_get_logits_ith(engine->ctx, k);
+                total_lp += log_prob_of_token(step_logits, n_vocab, ctoks[static_cast<size_t>(k + 1)]);
+            }
+        }
+
+        // 返回精确整串联合对数概率（不除以 token 数，避免 BPE 合并/拆分差异扭曲比较）
+        scores_out[i] = total_lp;
+        scored_count += 1;
+    }
+
     if (elapsed_ms_out) *elapsed_ms_out = elapsed_ms(t0);
     return !cancelled && scored_count >= 2;
 }
@@ -687,7 +851,10 @@ SPMLlamaBranchResult spm_llama_predict_branches(
     const int32_t clamped_steps = std::max<int32_t>(2, std::min<int32_t>(8, max_tokens_per_branch));
 
     std::lock_guard<std::mutex> lock(engine->exec_mutex);
-    engine->cancel_requested.store(false, std::memory_order_release);
+    if (engine->cancel_requested.load(std::memory_order_acquire)) {
+        res.cancelled = true;
+        return res;
+    }
 
     auto t0 = Clock::now();
     llama_memory_t mem = llama_get_memory(engine->ctx);
@@ -1056,6 +1223,347 @@ void spm_llama_free_branch_result(SPMLlamaBranchResult* result) {
     if (result->items) {
         for (int32_t i = 0; i < result->count; ++i) {
             std::free(result->items[i].text);
+        }
+        std::free(result->items);
+        result->items = nullptr;
+    }
+    result->count = 0;
+}
+
+namespace {
+
+bool is_pure_cjk_piece(const std::string& piece, size_t& out_char_count) {
+    out_char_count = 0;
+    if (piece.empty()) return false;
+    size_t i = 0;
+    while (i < piece.size()) {
+        uint32_t cp = 0;
+        size_t len = 0;
+        if (!decode_utf8_codepoint(piece, i, cp, len)) return false;
+        if (!is_cjk_codepoint(cp)) return false;
+        out_char_count += 1;
+        i += len;
+    }
+    return out_char_count >= 1 && out_char_count <= 3;
+}
+
+} // namespace
+
+SPMLlamaSurprisalResult spm_llama_probe_surprisal_proposals(
+    SPMLlamaEngine* engine,
+    const char* text,
+    double surprisal_threshold,
+    int32_t top_k,
+    int32_t timeout_ms
+) {
+    SPMLlamaSurprisalResult res{};
+    if (!engine || !engine->ctx || !engine->vocab || !text || text[0] == '\0') {
+        return res;
+    }
+
+    const int32_t clamped_k = std::max<int32_t>(4, std::min<int32_t>(256, top_k));
+    std::lock_guard<std::mutex> lock(engine->exec_mutex);
+    if (engine->cancel_requested.load(std::memory_order_acquire)) {
+        res.cancelled = true;
+        return res;
+    }
+
+    auto t0 = Clock::now();
+    llama_memory_t mem = llama_get_memory(engine->ctx);
+    llama_memory_clear(mem, true);
+
+    const int32_t n_vocab_init = llama_vocab_n_tokens(engine->vocab);
+    if (!engine->cjk_vocab_ready && n_vocab_init > 0) {
+        engine->pure_cjk_vocab.clear();
+        engine->pure_cjk_vocab.reserve(32000);
+        for (int32_t v = 0; v < n_vocab_init; ++v) {
+            if (llama_vocab_is_eog(engine->vocab, v)) continue;
+            std::string piece = token_to_string(engine->vocab, v);
+            size_t cjk_len = 0;
+            if (is_pure_cjk_piece(piece, cjk_len)) {
+                engine->pure_cjk_vocab.push_back(PureCJKVocabEntry{v, std::move(piece)});
+            }
+        }
+        engine->cjk_vocab_ready = true;
+    }
+
+    const std::string text_str(text);
+    std::vector<llama_token> role_head;
+    const char* chat_tmpl = llama_model_chat_template(engine->model, nullptr);
+    if (chat_tmpl && std::strstr(chat_tmpl, "<|im_start|>") != nullptr) {
+        role_head = tokenize_string(engine->vocab, "<|im_start|>user\n", false, true);
+    } else {
+        llama_token bos = llama_vocab_bos(engine->vocab);
+        if (bos >= 0) role_head.push_back(bos);
+    }
+
+    std::vector<llama_token> text_tokens = tokenize_string(engine->vocab, text_str, false, false);
+    if (role_head.empty() || text_tokens.empty()) {
+        res.total_ms = elapsed_ms(t0);
+        return res;
+    }
+
+    // 限制在单批次可执行长度内（默认 n_batch=128，足以覆盖 ~180 汉字整句）
+    const int32_t max_text_toks = std::max<int32_t>(
+        1,
+        std::min<int32_t>(engine->n_batch, engine->n_ctx - 2) - static_cast<int32_t>(role_head.size())
+    );
+    if (static_cast<int32_t>(text_tokens.size()) > max_text_toks) {
+        text_tokens.resize(static_cast<size_t>(max_text_toks));
+    }
+
+    const int32_t role_len = static_cast<int32_t>(role_head.size());
+    const int32_t text_len = static_cast<int32_t>(text_tokens.size());
+    const int32_t total_len = role_len + text_len;
+
+    struct ScopedBatch {
+        llama_batch batch;
+        explicit ScopedBatch(int32_t cap) : batch(llama_batch_init(cap, 0, 1)) {}
+        ~ScopedBatch() { llama_batch_free(batch); }
+        ScopedBatch(const ScopedBatch&) = delete;
+        ScopedBatch& operator=(const ScopedBatch&) = delete;
+    } scoped(total_len);
+
+    scoped.batch.n_tokens = total_len;
+    for (int32_t i = 0; i < role_len; ++i) {
+        scoped.batch.token[i] = role_head[static_cast<size_t>(i)];
+        scoped.batch.pos[i] = i;
+        scoped.batch.n_seq_id[i] = 1;
+        scoped.batch.seq_id[i][0] = 0;
+        // 仅在 role_head 末位输出 logits 以预测 text_tokens[0]
+        scoped.batch.logits[i] = (i == role_len - 1) ? 1 : 0;
+    }
+    for (int32_t j = 0; j < text_len; ++j) {
+        const int32_t idx = role_len + j;
+        scoped.batch.token[idx] = text_tokens[static_cast<size_t>(j)];
+        scoped.batch.pos[idx] = idx;
+        scoped.batch.n_seq_id[idx] = 1;
+        scoped.batch.seq_id[idx][0] = 0;
+        // 预测下一个 token text_tokens[j + 1]；最后一个 token 无需 logits
+        scoped.batch.logits[idx] = (j + 1 < text_len) ? 1 : 0;
+    }
+
+    if (engine->cancel_requested.load(std::memory_order_acquire)) {
+        res.cancelled = true;
+        res.total_ms = elapsed_ms(t0);
+        return res;
+    }
+    if (llama_decode(engine->ctx, scoped.batch) != 0) {
+        res.total_ms = elapsed_ms(t0);
+        return res;
+    }
+
+    const int32_t n_vocab = llama_vocab_n_tokens(engine->vocab);
+    if (n_vocab <= 0) {
+        res.total_ms = elapsed_ms(t0);
+        return res;
+    }
+
+    // 1. 映射每个 token 在原文中的 UTF-8 字节区间，并计算其条件对数概率
+    std::vector<int32_t> tok_offsets(static_cast<size_t>(text_len), -1);
+    std::vector<int32_t> tok_lengths(static_cast<size_t>(text_len), 0);
+    std::vector<double> tok_lps(static_cast<size_t>(text_len), 0.0);
+    std::vector<double> tok_log_z(static_cast<size_t>(text_len), 0.0);
+    std::vector<float> tok_max_lg(static_cast<size_t>(text_len), 0.0f);
+
+    size_t byte_cursor = 0;
+    bool alignment_ok = true;
+    for (int32_t j = 0; j < text_len; ++j) {
+        const float* logits = llama_get_logits_ith(engine->ctx, role_len - 1 + j);
+        if (logits) {
+            float max_lg = logits[0];
+            for (int32_t v = 1; v < n_vocab; ++v) {
+                if (logits[v] > max_lg) max_lg = logits[v];
+            }
+            tok_max_lg[static_cast<size_t>(j)] = max_lg;
+            const float exp_cutoff = max_lg - 20.0f;
+            double sum_exp = 0.0;
+            for (int32_t v = 0; v < n_vocab; ++v) {
+                if (logits[v] > exp_cutoff) {
+                    sum_exp += std::exp(static_cast<double>(logits[v] - max_lg));
+                }
+            }
+            const double lz = static_cast<double>(max_lg) + std::log(sum_exp);
+            tok_log_z[static_cast<size_t>(j)] = lz;
+            const llama_token target = text_tokens[static_cast<size_t>(j)];
+            tok_lps[static_cast<size_t>(j)] = (target >= 0 && target < n_vocab)
+                ? (static_cast<double>(logits[target]) - lz)
+                : -20.0;
+        } else {
+            tok_lps[static_cast<size_t>(j)] = -20.0;
+        }
+
+        if (alignment_ok) {
+            std::string piece = token_to_string(engine->vocab, text_tokens[static_cast<size_t>(j)]);
+            if (byte_cursor + piece.size() <= text_str.size()
+                && text_str.compare(byte_cursor, piece.size(), piece) == 0) {
+                tok_offsets[static_cast<size_t>(j)] = static_cast<int32_t>(byte_cursor);
+                tok_lengths[static_cast<size_t>(j)] = static_cast<int32_t>(piece.size());
+                byte_cursor += piece.size();
+            } else {
+                alignment_ok = false;
+            }
+        }
+    }
+
+    // 2. 筛选需要做 Top-K 替换扫描的位置：
+    //    (a) 本位高惊讶度（lp < surprisal_threshold）
+    //    (b) 下一 token 高惊讶度（捕获双字词拆 token 错字，如「电+恼」在「电」处提议「电脑」、「再+上海」在「再」处提议「在上海」）
+    struct ScanTarget {
+        int32_t j;
+        double priority_lp;
+    };
+    std::vector<ScanTarget> targets;
+    targets.reserve(static_cast<size_t>(text_len));
+    for (int32_t j = 0; j < text_len; ++j) {
+        const int32_t boff = tok_offsets[static_cast<size_t>(j)];
+        if (boff < 0 || static_cast<size_t>(boff) >= text_str.size()) continue;
+        // 跳过落在多字节 UTF-8 中间的字节偏移
+        if ((static_cast<unsigned char>(text_str[static_cast<size_t>(boff)]) & 0xC0) == 0x80) continue;
+
+        const double cur_lp = tok_lps[static_cast<size_t>(j)];
+        const double next_lp = (j + 1 < text_len) ? tok_lps[static_cast<size_t>(j + 1)] : 0.0;
+        const bool self_surprised = (cur_lp < surprisal_threshold);
+        const bool next_surprised = (j + 1 < text_len && next_lp < (surprisal_threshold - 0.3));
+        if (self_surprised || next_surprised) {
+            targets.push_back(ScanTarget{j, std::min(cur_lp, next_lp)});
+        }
+    }
+
+    // 优先处理最惊讶的前 12 处位置
+    if (targets.size() > 12) {
+        std::sort(targets.begin(), targets.end(), [](const ScanTarget& a, const ScanTarget& b) {
+            return a.priority_lp < b.priority_lp;
+        });
+        targets.resize(12);
+        std::sort(targets.begin(), targets.end(), [](const ScanTarget& a, const ScanTarget& b) {
+            return a.j < b.j;
+        });
+    }
+
+    struct BuiltProposal {
+        int32_t byte_offset;
+        int32_t byte_length;
+        double token_logprob;
+        std::vector<std::string> alts;
+        std::vector<double> alt_lps;
+    };
+    std::vector<BuiltProposal> built;
+    built.reserve(targets.size());
+
+    struct CJKTopEntry {
+        size_t vocab_idx;
+        float logit;
+    };
+    const auto min_heap_cmp = [](const CJKTopEntry& a, const CJKTopEntry& b) {
+        return a.logit > b.logit; // 最小堆：堆顶始终为当前 Top-K 中最低分
+    };
+
+    std::vector<CJKTopEntry> top_pool;
+    top_pool.reserve(static_cast<size_t>(clamped_k) + 1);
+
+    for (const auto& tgt : targets) {
+        if (engine->cancel_requested.load(std::memory_order_acquire)) {
+            res.cancelled = true;
+            break;
+        }
+        if (timeout_ms > 0 && elapsed_ms(t0) > static_cast<double>(timeout_ms)) {
+            break;
+        }
+
+        const int32_t j = tgt.j;
+        const float* logits = llama_get_logits_ith(engine->ctx, role_len - 1 + j);
+        if (!logits) continue;
+
+        const double lz = tok_log_z[static_cast<size_t>(j)];
+        const llama_token orig_tok = text_tokens[static_cast<size_t>(j)];
+        // 仅扫描预索引的纯 1~3 汉字词表项（跳过 ~80% 英文/标点/碎片 token），零浪费且速度提升 ~5x
+        const float min_keep_lg = static_cast<float>(lz - 12.0);
+        top_pool.clear();
+        const auto& cjk_vocab = engine->pure_cjk_vocab;
+        for (size_t vi = 0; vi < cjk_vocab.size(); ++vi) {
+            const llama_token v = cjk_vocab[vi].token;
+            if (v == orig_tok || v < 0 || v >= n_vocab) continue;
+            const float lg = logits[v];
+            if (lg < min_keep_lg) continue;
+            if (static_cast<int32_t>(top_pool.size()) < clamped_k) {
+                top_pool.push_back(CJKTopEntry{vi, lg});
+                if (static_cast<int32_t>(top_pool.size()) == clamped_k) {
+                    std::make_heap(top_pool.begin(), top_pool.end(), min_heap_cmp);
+                }
+            } else if (lg > top_pool.front().logit) {
+                std::pop_heap(top_pool.begin(), top_pool.end(), min_heap_cmp);
+                top_pool.back() = CJKTopEntry{vi, lg};
+                std::push_heap(top_pool.begin(), top_pool.end(), min_heap_cmp);
+            }
+        }
+
+        std::sort(top_pool.begin(), top_pool.end(), [](const CJKTopEntry& a, const CJKTopEntry& b) {
+            return a.logit > b.logit;
+        });
+
+        BuiltProposal prop;
+        prop.byte_offset = tok_offsets[static_cast<size_t>(j)];
+        prop.byte_length = tok_lengths[static_cast<size_t>(j)];
+        prop.token_logprob = tok_lps[static_cast<size_t>(j)];
+        prop.alts.reserve(top_pool.size());
+        prop.alt_lps.reserve(top_pool.size());
+
+        for (const auto& entry : top_pool) {
+            const double alt_lp = static_cast<double>(entry.logit) - lz;
+            if (alt_lp < -12.0) continue;
+            prop.alts.push_back(cjk_vocab[entry.vocab_idx].piece);
+            prop.alt_lps.push_back(alt_lp);
+        }
+
+        if (!prop.alts.empty()) {
+            built.push_back(std::move(prop));
+        }
+    }
+
+    if (!res.cancelled && !built.empty()) {
+        auto* items = static_cast<SPMLlamaTokenProposal*>(
+            std::calloc(built.size(), sizeof(SPMLlamaTokenProposal))
+        );
+        if (items) {
+            for (size_t i = 0; i < built.size(); ++i) {
+                const auto& b = built[i];
+                items[i].byte_offset = b.byte_offset;
+                items[i].byte_length = b.byte_length;
+                items[i].token_logprob = b.token_logprob;
+                const size_t ac = b.alts.size();
+                items[i].alt_texts = static_cast<char**>(std::calloc(ac, sizeof(char*)));
+                items[i].alt_logprobs = static_cast<double*>(std::calloc(ac, sizeof(double)));
+                if (items[i].alt_texts && items[i].alt_logprobs) {
+                    items[i].alt_count = static_cast<int32_t>(ac);
+                    for (size_t k = 0; k < ac; ++k) {
+                        items[i].alt_texts[k] = strdup(b.alts[k].c_str());
+                        items[i].alt_logprobs[k] = b.alt_lps[k];
+                    }
+                }
+            }
+            res.items = items;
+            res.count = static_cast<int32_t>(built.size());
+        }
+    }
+
+    res.total_ms = elapsed_ms(t0);
+    res.ok = !res.cancelled;
+    return res;
+}
+
+void spm_llama_free_surprisal_result(SPMLlamaSurprisalResult* result) {
+    if (!result) return;
+    if (result->items) {
+        for (int32_t i = 0; i < result->count; ++i) {
+            auto& item = result->items[i];
+            if (item.alt_texts) {
+                for (int32_t k = 0; k < item.alt_count; ++k) {
+                    std::free(item.alt_texts[k]);
+                }
+                std::free(item.alt_texts);
+            }
+            std::free(item.alt_logprobs);
         }
         std::free(result->items);
         result->items = nullptr;

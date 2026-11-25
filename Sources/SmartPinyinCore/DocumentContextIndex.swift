@@ -119,7 +119,7 @@ public final class DocumentContextIndex: @unchecked Sendable {
             }
         }
 
-        // 2. 构建相邻中文短语（2-gram 拼接，2~8 字）与锚点后续映射（prev -> next）
+        // 2. 构建相邻短语（纯中文 2-gram 与中英混输短语，如 git地址 / React组件 / 打开VSCode）与锚点后续映射（prev -> next）
         for i in 0..<wordTokens.count {
             let cur = wordTokens[i]
             if i + 1 < wordTokens.count {
@@ -134,10 +134,20 @@ public final class DocumentContextIndex: @unchecked Sendable {
                             let d = abs(cursorPos - cur.startOffset)
                             zhDist[combined] = min(zhDist[combined] ?? Int.max, d)
                         }
+                    } else if cur.isChinese != next.isChinese {
+                        // 中英混输短语（如 git地址 / React组件 / 打开VSCode / 修复bug）
+                        let combined = cur.text + next.text
+                        if combined.count >= 3 && combined.count <= 14 {
+                            zhFreq[combined, default: 0] += 1
+                            let d = abs(cursorPos - cur.startOffset)
+                            zhDist[combined] = min(zhDist[combined] ?? Int.max, d)
+                        }
                     }
-                    // 锚点：用前词末 2 字（或完整前词）预测下一词（或下一词+再下一词的 2~6 字短语）
-                    if cur.isChinese && cur.text.count >= 2 {
-                        let anchorKeys = [String(cur.text.suffix(2)), cur.text]
+                    // 锚点：支持中文词尾 2 字/整词 及 >= 2 字符英文词（如 git -> 地址 / React -> 组件）
+                    if cur.text.count >= 2 {
+                        let anchorKeys: [String] = cur.isChinese
+                            ? [String(cur.text.suffix(2)), cur.text]
+                            : [cur.text, cur.text.lowercased()]
                         for ak in Set(anchorKeys) where ak.count >= 2 {
                             anchors[ak, default: [:]][next.text, default: 0] += 1
                             if i + 2 < wordTokens.count, next.isChinese, wordTokens[i + 2].isChinese {
@@ -155,7 +165,7 @@ public final class DocumentContextIndex: @unchecked Sendable {
             }
         }
 
-        // 3. 预构建拼音与简拼键（只保留前 350 个高价值中文词 + 160 个英文标识符，建索引 < 15ms）
+        // 3. 预构建拼音与简拼键（只保留前 350 个高价值中文/中英混合词 + 160 个英文标识符，建索引 < 15ms）
         let topZh = zhFreq.sorted { lhs, rhs in
             if lhs.value != rhs.value { return lhs.value > rhs.value }
             return (zhDist[lhs.key] ?? Int.max) < (zhDist[rhs.key] ?? Int.max)
@@ -164,7 +174,7 @@ public final class DocumentContextIndex: @unchecked Sendable {
         var builtZh: [IndexedChineseTerm] = []
         builtZh.reserveCapacity(topZh.count)
         for (term, freq) in topZh {
-            let keys = normalizer.keys(forChineseTerm: term)
+            let keys = normalizer.keys(forMixedTerm: term)
             if !keys.fullVariants.isEmpty {
                 builtZh.append(IndexedChineseTerm(
                     text: term,
@@ -219,11 +229,22 @@ public final class DocumentContextIndex: @unchecked Sendable {
         let enSnapshot = englishTerms
         var continuationBoosts: [String: Int] = [:]
         if trimmedLeft.count >= 2 {
+            var checkedAnchors = Set<String>()
             for len in [4, 3, 2] where trimmedLeft.count >= len {
                 let anchor = String(trimmedLeft.suffix(len))
-                if let followups = anchorContinuations[anchor] {
+                if checkedAnchors.insert(anchor).inserted, let followups = anchorContinuations[anchor] {
                     for (word, cnt) in followups {
                         continuationBoosts[word, default: 0] += cnt * (len == 2 ? 1 : 2)
+                    }
+                }
+            }
+            if let trailingEn = Self.trailingEnglishAnchor(in: trimmedLeft) {
+                for enAnchor in [trailingEn, trailingEn.lowercased()]
+                where checkedAnchors.insert(enAnchor).inserted {
+                    if let followups = anchorContinuations[enAnchor] {
+                        for (word, cnt) in followups {
+                            continuationBoosts[word, default: 0] += cnt * 2
+                        }
                     }
                 }
             }
@@ -320,11 +341,23 @@ public final class DocumentContextIndex: @unchecked Sendable {
 
         lock.lock()
         var scores: [String: Int] = [:]
+        var checkedAnchors = Set<String>()
         for len in [4, 3, 2] where trimmedLeft.count >= len {
             let anchor = String(trimmedLeft.suffix(len))
-            if let followups = anchorContinuations[anchor] {
+            if checkedAnchors.insert(anchor).inserted, let followups = anchorContinuations[anchor] {
                 for (word, cnt) in followups {
                     scores[word, default: 0] += cnt * len
+                }
+            }
+        }
+        if let trailingEn = Self.trailingEnglishAnchor(in: trimmedLeft) {
+            let weight = min(4, trailingEn.count)
+            for enAnchor in [trailingEn, trailingEn.lowercased()]
+            where checkedAnchors.insert(enAnchor).inserted {
+                if let followups = anchorContinuations[enAnchor] {
+                    for (word, cnt) in followups {
+                        scores[word, default: 0] += cnt * weight
+                    }
                 }
             }
         }
@@ -378,7 +411,10 @@ public final class DocumentContextIndex: @unchecked Sendable {
     }
 
     private static func isEnglishIdentifier(_ s: String) -> Bool {
-        guard s.count >= 3 && s.count <= 32, let first = s.first, first.isASCII && first.isLetter else {
+        guard s.count >= 2 && s.count <= 32, let first = s.first, first.isASCII && first.isLetter else {
+            return false
+        }
+        if s.count == 2 && !s.contains(where: { $0.isUppercase || $0.isNumber }) {
             return false
         }
         return s.unicodeScalars.allSatisfy {
@@ -387,5 +423,24 @@ public final class DocumentContextIndex: @unchecked Sendable {
                 || ($0.value >= 48 && $0.value <= 57)
                 || $0.value == 95
         }
+    }
+
+    private static func trailingEnglishAnchor(in text: String) -> String? {
+        guard let last = text.last,
+              last.isASCII && (last.isLetter || last.isNumber || last == "_") else {
+            return nil
+        }
+        var chars: [Character] = []
+        for ch in text.reversed() {
+            if ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_") {
+                chars.append(ch)
+                if chars.count > 24 { return nil }
+            } else {
+                break
+            }
+        }
+        let word = String(chars.reversed())
+        guard word.count >= 2, let first = word.first, first.isLetter else { return nil }
+        return word
     }
 }

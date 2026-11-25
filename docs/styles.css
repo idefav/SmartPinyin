@@ -691,6 +691,20 @@ html[data-theme="light"] .badge-domain { color: #047857; }
   border-color: rgba(255, 255, 255, 0.38);
 }
 
+.badge-mixed {
+  background: rgba(6, 182, 212, 0.22);
+  color: #67e8f9;
+  border: 1px solid rgba(34, 211, 238, 0.42);
+}
+
+html[data-theme="light"] .badge-mixed { color: #0e7490; }
+
+.cand-item.selected .badge-mixed {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.38);
+}
+
 /* Translation preview inside HUD */
 .hud-translate-row {
   margin-top: 10px;

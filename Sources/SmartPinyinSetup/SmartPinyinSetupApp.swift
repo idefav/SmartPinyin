@@ -86,6 +86,35 @@ private struct StatusDashboardView: View {
                         .buttonStyle(.bordered)
                 }
 
+                if let banner = vm.infoBanner {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text(banner).font(.caption)
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if let err = vm.errorMessage {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                        Text(err).font(.caption)
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                }
+                if vm.hasMultipleInstalledCopies {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        Text("检测到系统中同时存在多份 SmartPinyin.app 副本，建议在「卸载自己」清理后统一使用系统级安装。")
+                            .font(.caption)
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                }
+
                 GroupBox("系统集成状态") {
                     VStack(alignment: .leading, spacing: 10) {
                         row("安装位置", value: vm.installedBundlePath ?? "未安装", ok: vm.installedBundlePath != nil)
@@ -101,7 +130,7 @@ private struct StatusDashboardView: View {
                         .buttonStyle(.borderedProminent)
                     Button("打开键盘输入源设置") { vm.openKeyboardInputSourcesSettings() }
                         .buttonStyle(.bordered)
-                    Button("打开辅助功能设置") { vm.openAccessibilitySettings() }
+                    Button("前往辅助功能授权") { vm.requestAccessibilityPermission() }
                         .buttonStyle(.bordered)
                 }
 
@@ -118,13 +147,31 @@ private struct StatusDashboardView: View {
                                 case .discoverable:
                                     Button("一键导入") { vm.importDiscoveredModel(item) }
                                         .buttonStyle(.borderedProminent).controlSize(.small)
+                                        .disabled(vm.downloadingModelID != nil || vm.isBusy)
                                 case .missing:
                                     Button("导入本地") { vm.pickAndImportLocalModel(for: item.spec) }
                                         .buttonStyle(.bordered).controlSize(.small)
+                                        .disabled(vm.downloadingModelID != nil || vm.isBusy)
                                     Button("在线下载") { vm.downloadModel(item.spec) }
                                         .buttonStyle(.borderedProminent).controlSize(.small)
+                                        .disabled(vm.downloadingModelID != nil || vm.isBusy)
                                 }
                             }
+                        }
+                        if let activeID = vm.downloadingModelID {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ProgressView(value: vm.downloadProgress)
+                                HStack {
+                                    Text("正在下载 \(activeID)：\(vm.downloadDetailText)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("取消下载") { vm.cancelModelDownload() }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.mini)
+                                }
+                            }
+                            .padding(.top, 4)
                         }
                     }
                     .padding(8)

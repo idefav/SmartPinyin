@@ -131,6 +131,8 @@ public final class ModelProvisioner: @unchecked Sendable {
         if let bundleModels = Bundle.main.resourceURL?.appendingPathComponent("Models", isDirectory: true) {
             searchDirs.append(bundleModels)
         }
+        // 支持无桌面会话（SSH/MDM）安装 Full PKG 时遗留在系统暂存目录的内置模型
+        searchDirs.append(URL(fileURLWithPath: "/Library/Application Support/SmartPinyin/BundledModels", isDirectory: true))
         if let envDir = ProcessInfo.processInfo.environment["SMARTPINYIN_MODELS_DIR"], !envDir.isEmpty {
             searchDirs.append(URL(fileURLWithPath: envDir, isDirectory: true))
         }
@@ -182,6 +184,7 @@ public final class ModelProvisioner: @unchecked Sendable {
 
         var lastError: Error = ModelProvisionError.downloadFailed("无可用下载源")
         for url in spec.downloadURLs {
+            try Task.checkCancellation()
             do {
                 let downloaded = try await performDownload(from: url, to: tempURL, onProgress: onProgress)
                 guard Self.validateGGUFFile(at: downloaded, minBytes: spec.minValidBytes) != nil else {
@@ -192,7 +195,12 @@ public final class ModelProvisioner: @unchecked Sendable {
                 }
                 try fm.moveItem(at: downloaded, to: destURL)
                 return destURL
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
                 lastError = error
             }
         }
@@ -208,7 +216,7 @@ public final class ModelProvisioner: @unchecked Sendable {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 3600
-        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        let session = URLSession(configuration: config)
         defer { session.finishTasksAndInvalidate() }
 
         let (localTmp, response) = try await session.download(from: url, delegate: delegate)

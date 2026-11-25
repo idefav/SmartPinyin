@@ -4,14 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="0.1.0"
 ARCH="arm64"
-FORMAT="all"          # dmg | pkg | all
+FORMAT="all"          # app | dmg | pkg | all
 BUNDLE_MODELS=1       # 默认内置本地小模型，开箱即用免在线下载
 SIGN_IDENTITY=""      # 默认自动探测本机稳定 Apple Development / Developer ID 证书以保障 TCC 权限稳定
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --format)
-      FORMAT="${2:-all}"
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'ERROR: --format requires a value (app|dmg|pkg|all).\n' >&2
+        exit 2
+      fi
+      FORMAT="$2"
       shift 2
       ;;
     --bundle-models)
@@ -23,11 +27,19 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --sign-identity)
-      SIGN_IDENTITY="${2:--}"
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'ERROR: --sign-identity requires a value.\n' >&2
+        exit 2
+      fi
+      SIGN_IDENTITY="$2"
       shift 2
       ;;
     --version)
-      VERSION="${2:-0.1.0}"
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'ERROR: --version requires a value.\n' >&2
+        exit 2
+      fi
+      VERSION="$2"
       shift 2
       ;;
     *)
@@ -48,15 +60,45 @@ fi
 if [ -z "$SIGN_IDENTITY" ]; then
   SIGN_IDENTITY="-"
 fi
-printf '==> Using codesign identity: %s (bundle_models=%d)\n' "$SIGN_IDENTITY" "$BUNDLE_MODELS"
+printf '==> Using codesign identity: %s (format=%s, bundle_models=%d)\n' "$SIGN_IDENTITY" "$FORMAT" "$BUNDLE_MODELS"
 
 case "$FORMAT" in
-  dmg|pkg|all) ;;
+  app|dmg|pkg|all) ;;
   *)
-    printf 'Invalid --format value: %s (expected dmg|pkg|all)\n' "$FORMAT" >&2
+    printf 'Invalid --format value: %s (expected app|dmg|pkg|all)\n' "$FORMAT" >&2
     exit 2
     ;;
 esac
+
+validate_gguf_asset() {
+  local file="$1"
+  local min_bytes="$2"
+  [ -f "$file" ] || return 1
+  local size
+  size="$(stat -f '%z' "$file" 2>/dev/null || echo 0)"
+  [ "$size" -ge "$min_bytes" ] || return 1
+  local magic_hex
+  magic_hex="$(od -An -tx1 -N4 "$file" 2>/dev/null | tr -d ' \t\r\n')"
+  [ "$magic_hex" = "47475546" ]
+}
+
+# 打包前强制前置校验，防止静默产出缺失词库/动态库/模型的残缺安装包
+if [ ! -f "$ROOT_DIR/Vendor/librime/dist/lib/librime.1.17.0.dylib" ] || [ ! -f "$ROOT_DIR/Resources/RimeData/wanxiang.schema.yaml" ]; then
+  printf 'ERROR: Missing Vendor/librime or Resources/RimeData. Run Scripts/fetch-deps.sh first.\n' >&2
+  exit 1
+fi
+if [ "$BUNDLE_MODELS" -eq 1 ] && [ "$FORMAT" != "app" ]; then
+  QWEN_MODEL="$ROOT_DIR/Models/Qwen3-0.6B-Q4_K_M.gguf"
+  HYMT_MODEL="$ROOT_DIR/Models/HY-MT1.5-1.8B-Q4_K_M.gguf"
+  if ! validate_gguf_asset "$QWEN_MODEL" 200000000; then
+    printf 'ERROR: --bundle-models requested, but valid %s is missing. Run Scripts/fetch-deps.sh --with-models first.\n' "$QWEN_MODEL" >&2
+    exit 1
+  fi
+  if ! validate_gguf_asset "$HYMT_MODEL" 700000000; then
+    printf 'ERROR: --bundle-models requested, but valid %s is missing. Run Scripts/fetch-deps.sh --with-models first.\n' "$HYMT_MODEL" >&2
+    exit 1
+  fi
+fi
 
 BUILD_DIR="$ROOT_DIR/build"
 STAGE_DIR="$BUILD_DIR/package-stage"
@@ -286,14 +328,24 @@ cp -af "$ROOT_DIR/Vendor/librime/dist/lib/rime-plugins"/*.dylib "$IME_APP/Conten
 LLAMA_LIB_DIR="$(brew --prefix llama.cpp)/lib"
 GGML_PREFIX="$(brew --prefix ggml 2>/dev/null || brew --prefix llama.cpp)"
 LIBOMP_LIB_DIR="$(brew --prefix libomp)/lib"
-cp -af "$LLAMA_LIB_DIR"/libllama.dylib "$LLAMA_LIB_DIR"/libllama.*.dylib "$IME_APP/Contents/Frameworks/" 2>/dev/null || true
-cp -af "$GGML_PREFIX/lib"/libggml.dylib "$GGML_PREFIX/lib"/libggml.*.dylib "$GGML_PREFIX/lib"/libggml-base*.dylib "$IME_APP/Contents/Frameworks/" 2>/dev/null || true
+shopt -s nullglob
+LLAMA_DYLIBS=("$LLAMA_LIB_DIR"/libllama.dylib "$LLAMA_LIB_DIR"/libllama.*.dylib)
+GGML_DYLIBS=("$GGML_PREFIX/lib"/libggml.dylib "$GGML_PREFIX/lib"/libggml.*.dylib "$GGML_PREFIX/lib"/libggml-base*.dylib)
+GGML_BACKENDS=()
 if [ -d "$GGML_PREFIX/libexec" ]; then
-  cp -af "$GGML_PREFIX/libexec"/*.so "$IME_APP/Contents/Frameworks/ggml-backends/" 2>/dev/null || true
+  GGML_BACKENDS=("$GGML_PREFIX/libexec"/*.so)
 elif [ -d "$LLAMA_LIB_DIR" ]; then
-  cp -af "$LLAMA_LIB_DIR"/libggml-*.so "$IME_APP/Contents/Frameworks/ggml-backends/" 2>/dev/null || true
+  GGML_BACKENDS=("$LLAMA_LIB_DIR"/libggml-*.so)
 fi
-cp -af "$LIBOMP_LIB_DIR"/libomp.dylib "$IME_APP/Contents/Frameworks/"
+shopt -u nullglob
+if [ "${#LLAMA_DYLIBS[@]}" -eq 0 ] || [ "${#GGML_DYLIBS[@]}" -eq 0 ] || [ ! -f "$LIBOMP_LIB_DIR/libomp.dylib" ] || [ "${#GGML_BACKENDS[@]}" -eq 0 ]; then
+  printf 'ERROR: Missing required llama.cpp/ggml/libomp shared libraries in Homebrew prefix.\n' >&2
+  exit 1
+fi
+cp -af "${LLAMA_DYLIBS[@]}" "$IME_APP/Contents/Frameworks/"
+cp -af "${GGML_DYLIBS[@]}" "$IME_APP/Contents/Frameworks/"
+cp -af "${GGML_BACKENDS[@]}" "$IME_APP/Contents/Frameworks/ggml-backends/"
+cp -af "$LIBOMP_LIB_DIR/libomp.dylib" "$IME_APP/Contents/Frameworks/"
 chmod -R u+w "$IME_APP/Contents/Frameworks"
 
 # 重写所有对 /opt/homebrew 或 /usr/local 的绝对路径依赖为 @rpath，保证安装包发到无 Homebrew 的 Mac 也能独立运行
@@ -356,7 +408,7 @@ while IFS= read -r -d '' macho; do
   fi
 done < <(find "$IME_APP" "$SETUP_HELPER" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" -o -path "*.framework/*" \) -print0)
 
-# 自包含防泄漏硬校验：确保所有 Mach-O 二进制 0 外部绝对依赖、0 开发机 LC_RPATH
+# 自包含防泄漏与 @rpath 完整性硬校验：确保 0 外部绝对依赖、0 开发机 LC_RPATH，且所有 @rpath 依赖均可在包内解析到真实文件
 # 注意：universal fat 二进制的 otool -L 会为每个架构打印头部路径，仅匹配 \t 缩进的依赖与 install_id 行
 VERIFY_LEAKS=0
 while IFS= read -r -d '' macho; do
@@ -369,10 +421,25 @@ while IFS= read -r -d '' macho; do
       [ -n "$bad_rpaths" ] && printf '  rpath: %s\n' "$bad_rpaths" >&2
       VERIFY_LEAKS=1
     fi
+    # 校验每个 @rpath 依赖是否在所属 .app 的 Contents/Frameworks（或 rime-plugins / ggml-backends）中真实存在
+    rpath_deps="$(otool -L "$macho" 2>/dev/null | awk 'NR>1 && /^\t@rpath\// {print $1}' | sort -u || true)"
+    if [ -n "$rpath_deps" ]; then
+      bundle_root="${macho%%/Contents/*}"
+      while IFS= read -r rdep; do
+        [ -n "$rdep" ] || continue
+        rel="${rdep#@rpath/}"
+        if [ ! -e "$bundle_root/Contents/Frameworks/$rel" ] \
+           && [ ! -e "$bundle_root/Contents/Frameworks/rime-plugins/$rel" ] \
+           && [ ! -e "$bundle_root/Contents/Frameworks/ggml-backends/$rel" ]; then
+          printf 'ERROR: Unresolved @rpath dependency in %s -> %s\n' "$macho" "$rdep" >&2
+          VERIFY_LEAKS=1
+        fi
+      done <<< "$rpath_deps"
+    fi
   fi
 done < <(find "$IME_APP" "$SETUP_HELPER" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" -o -path "*.framework/*" \) -print0)
 if [ "$VERIFY_LEAKS" -ne 0 ]; then
-  printf 'Aborting packaging due to leaked local paths.\n' >&2
+  printf 'Aborting packaging due to leaked local paths or unresolved @rpath dependencies.\n' >&2
   exit 1
 fi
 
@@ -382,10 +449,41 @@ if [ -d "$ROOT_DIR/Resources/Lexicon" ]; then
   rsync -a --delete "$ROOT_DIR/Resources/Lexicon/" "$IME_APP/Contents/Resources/Lexicon/"
 fi
 
+# 自内向外逐层显式签名（遵循 Apple 最佳实践，替代已弃用的 codesign --deep）
+sign_bundle_inside_out() {
+  local bundle="$1"
+  local fw_dir="$bundle/Contents/Frameworks"
+  if [ -d "$fw_dir" ]; then
+    while IFS= read -r -d '' lib; do
+      codesign --force --sign "$SIGN_IDENTITY" "$lib"
+    done < <(find "$fw_dir" -type f \( -name "*.dylib" -o -name "*.so" \) -print0)
+    while IFS= read -r -d '' fw; do
+      codesign --force --sign "$SIGN_IDENTITY" "$fw"
+    done < <(find "$fw_dir" -maxdepth 1 -type d -name "*.framework" -print0)
+  fi
+  if [ -d "$bundle/Contents/XPCServices" ]; then
+    while IFS= read -r -d '' xpc; do
+      codesign --force --sign "$SIGN_IDENTITY" "$xpc"
+    done < <(find "$bundle/Contents/XPCServices" -maxdepth 1 -type d -name "*.xpc" -print0)
+  fi
+  if [ -d "$bundle/Contents/Helpers" ]; then
+    while IFS= read -r -d '' helper; do
+      sign_bundle_inside_out "$helper"
+    done < <(find "$bundle/Contents/Helpers" -maxdepth 1 -type d -name "*.app" -print0)
+  fi
+  if [ -d "$bundle/Contents/Resources/Payload" ]; then
+    while IFS= read -r -d '' payload; do
+      sign_bundle_inside_out "$payload"
+    done < <(find "$bundle/Contents/Resources/Payload" -maxdepth 1 -type d -name "*.app" -print0)
+  fi
+  codesign --force --sign "$SIGN_IDENTITY" "$bundle"
+}
+
 # 将控制中心/自卸载器内嵌至输入法包中，供状态栏菜单随时唤起
-codesign --force --deep --sign "$SIGN_IDENTITY" "$SETUP_HELPER"
+sign_bundle_inside_out "$SETUP_HELPER"
+codesign --verify --deep --strict "$SETUP_HELPER"
 cp -R "$SETUP_HELPER" "$IME_APP/Contents/Helpers/SmartPinyinSetup.app"
-codesign --force --deep --sign "$SIGN_IDENTITY" "$IME_APP"
+sign_bundle_inside_out "$IME_APP"
 codesign --verify --deep --strict "$IME_APP"
 
 SUFFIX=""
@@ -404,12 +502,12 @@ if [ "$FORMAT" = "dmg" ] || [ "$FORMAT" = "all" ]; then
   mkdir -p "$INSTALLER_APP/Contents/Resources/Payload"
   cp -R "$IME_APP" "$INSTALLER_APP/Contents/Resources/Payload/SmartPinyin.app"
 
-  if [ "$BUNDLE_MODELS" -eq 1 ] && [ -d "$ROOT_DIR/Models" ]; then
+  if [ "$BUNDLE_MODELS" -eq 1 ]; then
     mkdir -p "$INSTALLER_APP/Contents/Resources/Models"
-    cp -L "$ROOT_DIR/Models"/*.gguf "$INSTALLER_APP/Contents/Resources/Models/" 2>/dev/null || true
+    cp -L "$ROOT_DIR/Models/Qwen3-0.6B-Q4_K_M.gguf" "$ROOT_DIR/Models/HY-MT1.5-1.8B-Q4_K_M.gguf" "$INSTALLER_APP/Contents/Resources/Models/"
   fi
 
-  codesign --force --deep --sign "$SIGN_IDENTITY" "$INSTALLER_APP"
+  sign_bundle_inside_out "$INSTALLER_APP"
   codesign --verify --deep --strict "$INSTALLER_APP"
 
   cat > "$DMG_STAGE/使用与卸载说明.txt" <<'TXT'
@@ -423,8 +521,9 @@ SmartPinyin macOS 原生智能输入法
 
 【核心功能与快捷键】
 - 短按 Shift          ：中文拼音 / 英文直出快速切换
-- 大写 / 驼峰 / 下划线 ：中英混输快车道（如 React / user_id 免切直出）；Shift+空格输英文短句
-- 智能自动纠错与模糊音 ：自动纠偏错键/漏键/连键/倒序（如 shaighai→上海）及前后鼻音模糊
+- 中英混输与英文纠错  ：直接敲 gitdiz→git地址、reactzj→React组件、dokcer→Docker；大写/驼峰/下划线免切英文，错拼按 Tab 纠正；Shift+空格输英文短句
+- 智能拼音纠错与模糊音：自动纠偏错键/漏键/连键/倒序（如 shaighai→上海）及前后鼻音模糊
+- 整句暂存校对（⌃⌥D） ：先按空格进草稿自动纠偏，确认无误再按空格整句上屏（也可输入 /d 开关）
 - 诗词/成语与场景适配 ：候选栏自动标注「诗」「成」微胶囊，0ms 智能感知游戏/数学/计算机/美术/科学场景并动态提权
 - 开源词库热更新管理  ：打开 SmartPinyin Setup →「词库与场景」一键更新万象词库、按需装扩展词库或导入自定义词表
 - 右 Option 单击/双击 ：空态 0ms 开关翻译模式 / 弹出 1–6 语种直选胶囊条（拼写时 Tab 切本句译文、⌃⌥T 一键全局关翻译）
@@ -464,11 +563,10 @@ if [ "$FORMAT" = "pkg" ] || [ "$FORMAT" = "all" ]; then
 
   cp -R "$IME_APP" "$PKG_ROOT/Library/Input Methods/SmartPinyin.app"
   cp -R "$SETUP_HELPER" "$PKG_ROOT/Applications/SmartPinyin Setup.app"
-  if [ "$BUNDLE_MODELS" -eq 1 ] && [ -d "$ROOT_DIR/Models" ]; then
-    mkdir -p "$PKG_ROOT/Applications/SmartPinyin Setup.app/Contents/Resources/Models"
-    cp -L "$ROOT_DIR/Models"/*.gguf "$PKG_ROOT/Applications/SmartPinyin Setup.app/Contents/Resources/Models/" 2>/dev/null || true
-    codesign --force --deep --sign "$SIGN_IDENTITY" "$PKG_ROOT/Applications/SmartPinyin Setup.app"
-    codesign --verify --deep --strict "$PKG_ROOT/Applications/SmartPinyin Setup.app"
+  if [ "$BUNDLE_MODELS" -eq 1 ]; then
+    # 放入独立暂存目录而非 Setup.app 包内，postinstall 同步给当前桌面用户后即清理，避免永久双份占用 ~1.46 GB 且不破坏 Setup.app 签名
+    mkdir -p "$PKG_ROOT/Library/Application Support/SmartPinyin/BundledModels"
+    cp -L "$ROOT_DIR/Models/Qwen3-0.6B-Q4_K_M.gguf" "$ROOT_DIR/Models/HY-MT1.5-1.8B-Q4_K_M.gguf" "$PKG_ROOT/Library/Application Support/SmartPinyin/BundledModels/"
   fi
 
   cp "$ROOT_DIR/Scripts/pkg/postinstall" "$PKG_SCRIPTS/postinstall"
@@ -508,8 +606,8 @@ ul { padding-left: 18px; }
 <h1>欢迎安装 SmartPinyin ${VERSION}</h1>
 <p>SmartPinyin 是一款专为 Apple Silicon 设计的 macOS 原生智能输入法：</p>
 <ul>
-  <li><b>L1 极速拼音底座与自动纠错</b>：基于 librime 与万象词库/语法模型，全拼/简拼/整句毫秒级响应，支持快打自动纠偏与可配置模糊音；</li>
-  <li><b>诗词/成语标识与智能场景词库</b>：离线精准标注「诗」「成」微胶囊，0ms 自动识别游戏/数学/计算机/美术/科学等场景动态调权，支持开源词库热更新与自定义词表导入；</li>
+  <li><b>L1 极速拼音底座与中英混输纠错</b>：基于 librime 与万象词库/语法模型，全拼/简拼/整句毫秒级响应，内置 7.3 万离线英文词库，支持 <code>gitdiz→git地址</code>、<code>dokcer→Docker</code> 与快打自动纠偏；</li>
+  <li><b>整句暂存校对与诗词/场景词库</b>：支持「两段空格」整句校对纠偏，离线精准标注「诗」「成」微胶囊，0ms 自动识别游戏/数学/计算机/美术/科学等场景动态调权；</li>
   <li><b>本地小模型增强（&lt; 2GB 内存）</b>：100% 离线运行语境重排、句末联想续写与中→英/多语种实时翻译；</li>
   <li><b>一键彻底自卸载</b>：随时通过输入法菜单或 SmartPinyin Setup 应用零残留卸载。</li>
 </ul>
@@ -567,6 +665,11 @@ if [ -x "$LSREG" ]; then
     "$STAGE_DIR/dmg-root/Install SmartPinyin.app"; do
     [ -e "$tmp_app" ] && "$LSREG" -u "$tmp_app" >/dev/null 2>&1 || true
   done
+fi
+
+if [ "$FORMAT" = "app" ]; then
+  printf '==> [6/6] App bundles ready in %s\n' "$STAGE_DIR"
+  exit 0
 fi
 
 printf '==> [6/6] Packaging summary (SHA-256)\n'

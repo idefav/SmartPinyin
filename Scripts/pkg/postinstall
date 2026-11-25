@@ -1,24 +1,42 @@
 #!/bin/sh
 set -eu
 
-# 识别当前桌面登录用户，避免以 root 身份启动图形化向导
+is_valid_gguf() {
+  file_path="$1"
+  min_bytes="$2"
+  [ -f "$file_path" ] || return 1
+  fsize="$(stat -f '%z' "$file_path" 2>/dev/null || echo 0)"
+  [ "$fsize" -ge "$min_bytes" ] || return 1
+  magic_hex="$(od -An -tx1 -N4 "$file_path" 2>/dev/null | tr -d ' \t\r\n')"
+  [ "$magic_hex" = "47475546" ]
+}
+
+# 1. 系统级清理与注册（无论是否存在桌面登录用户，SSH/MDM/开机界面安装均先完成系统态收口）
+pkill -x SmartPinyin 2>/dev/null || true
+pkill -x SmartPinyinInference 2>/dev/null || true
+pkill -x SmartPinyinSetup 2>/dev/null || true
+
+xattr -dr com.apple.quarantine "/Library/Input Methods/SmartPinyin.app" "/Applications/SmartPinyin Setup.app" 2>/dev/null || true
+rm -f /System/Library/Caches/com.apple.IntlDataCache* 2>/dev/null || true
+if [ -x "/Library/Input Methods/SmartPinyin.app/Contents/MacOS/SmartPinyin" ]; then
+  "/Library/Input Methods/SmartPinyin.app/Contents/MacOS/SmartPinyin" --register-system-cache >/dev/null 2>&1 || true
+fi
+
+# 2. 识别当前桌面登录用户，避免以 root 身份启动图形化向导
 CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
 if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
   exit 0
 fi
 
 CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
-if [ -z "$CONSOLE_UID" ]; then
+CONSOLE_GID="$(id -g "$CONSOLE_USER" 2>/dev/null || true)"
+if [ -z "$CONSOLE_UID" ] || [ -z "$CONSOLE_GID" ]; then
   exit 0
 fi
 
 CONSOLE_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //' || true)"
 
-# 停止旧版残留输入法进程（绝不强杀 imklaunchagent，避免打断其他 App 的输入连接）
-pkill -x SmartPinyin 2>/dev/null || true
-pkill -x SmartPinyinInference 2>/dev/null || true
-
-# 若当前用户目录残留旧版用户级副本，自动注销并清理，防止系统设置与 LaunchServices 出现双副本冲突
+# 3. 清理残留的旧版用户级副本并刷新桌面用户 LaunchServices 与用户态 IntlDataCache
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [ -n "$CONSOLE_HOME" ]; then
   LEGACY_USER_IME="$CONSOLE_HOME/Library/Input Methods/SmartPinyin.app"
@@ -26,14 +44,20 @@ if [ -n "$CONSOLE_HOME" ]; then
     [ -x "$LSREG" ] && /bin/launchctl asuser "$CONSOLE_UID" "$LSREG" -u "$LEGACY_USER_IME" >/dev/null 2>&1 || true
     rm -rf -- "$LEGACY_USER_IME" 2>/dev/null || true
   fi
+  LEGACY_USER_SETUP="$CONSOLE_HOME/Applications/SmartPinyin Setup.app"
+  if [ -d "$LEGACY_USER_SETUP" ]; then
+    [ -x "$LSREG" ] && /bin/launchctl asuser "$CONSOLE_UID" "$LSREG" -u "$LEGACY_USER_SETUP" >/dev/null 2>&1 || true
+    rm -rf -- "$LEGACY_USER_SETUP" 2>/dev/null || true
+  fi
 fi
 
-# 刷新系统级 IntlDataCache、清 quarantine 与重新注册 LaunchServices
-xattr -dr com.apple.quarantine "/Library/Input Methods/SmartPinyin.app" "/Applications/SmartPinyin Setup.app" 2>/dev/null || true
-rm -f /System/Library/Caches/com.apple.IntlDataCache* 2>/dev/null || true
-if [ -x "/Library/Input Methods/SmartPinyin.app/Contents/MacOS/SmartPinyin" ]; then
-  "/Library/Input Methods/SmartPinyin.app/Contents/MacOS/SmartPinyin" --register-system-cache >/dev/null 2>&1 || true
+USER_CACHE_DIR="$(/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)"
+if [ -n "$USER_CACHE_DIR" ] && [ -d "$USER_CACHE_DIR" ]; then
+  rm -f "$USER_CACHE_DIR"/com.apple.IntlDataCache* \
+        "$USER_CACHE_DIR/com.apple.Keyboard-Settings.extension"/com.apple.IntlDataCache* \
+        "$USER_CACHE_DIR/com.apple.TextInputUI.xpc.CursorUIViewService"/com.apple.IntlDataCache* 2>/dev/null || true
 fi
+
 if [ -x "$LSREG" ] && [ -d "/Library/Input Methods/SmartPinyin.app" ]; then
   /bin/launchctl asuser "$CONSOLE_UID" "$LSREG" -f "/Library/Input Methods/SmartPinyin.app" >/dev/null 2>&1 || true
 fi
@@ -41,22 +65,37 @@ if [ -x "$LSREG" ] && [ -d "/Applications/SmartPinyin Setup.app" ]; then
   /bin/launchctl asuser "$CONSOLE_UID" "$LSREG" -f "/Applications/SmartPinyin Setup.app" >/dev/null 2>&1 || true
 fi
 
-# 若安装包内置了本地 GGUF 模型，自动同步到当前桌面用户的 Application Support/SmartPinyin/Models
-BUNDLED_MODELS="/Applications/SmartPinyin Setup.app/Contents/Resources/Models"
-if [ -n "$CONSOLE_HOME" ] && [ -d "$BUNDLED_MODELS" ]; then
+# 4. 若 PKG 内置了本地 GGUF 模型（位于独立暂存目录而非 Setup.app 包内），校验完整性后同步到当前用户目录并清理暂存
+STAGED_MODELS="/Library/Application Support/SmartPinyin/BundledModels"
+LEGACY_BUNDLED_MODELS="/Applications/SmartPinyin Setup.app/Contents/Resources/Models"
+MODELS_SRC=""
+CLEANUP_STAGED=0
+if [ -d "$STAGED_MODELS" ]; then
+  MODELS_SRC="$STAGED_MODELS"
+  CLEANUP_STAGED=1
+elif [ -d "$LEGACY_BUNDLED_MODELS" ]; then
+  MODELS_SRC="$LEGACY_BUNDLED_MODELS"
+fi
+
+if [ -n "$CONSOLE_HOME" ] && [ -n "$MODELS_SRC" ]; then
   USER_MODELS_DIR="$CONSOLE_HOME/Library/Application Support/SmartPinyin/Models"
   mkdir -p "$USER_MODELS_DIR"
-  for gguf in "$BUNDLED_MODELS"/*.gguf; do
+  for gguf in "$MODELS_SRC"/*.gguf; do
     [ -f "$gguf" ] || continue
     base="$(basename "$gguf")"
-    if [ ! -s "$USER_MODELS_DIR/$base" ]; then
+    src_size="$(stat -f '%z' "$gguf" 2>/dev/null || echo 1048576)"
+    if ! is_valid_gguf "$USER_MODELS_DIR/$base" "$src_size"; then
       cp -f "$gguf" "$USER_MODELS_DIR/$base"
     fi
   done
-  chown -R "$CONSOLE_USER:staff" "$CONSOLE_HOME/Library/Application Support/SmartPinyin" 2>/dev/null || true
+  chown -R "${CONSOLE_UID}:${CONSOLE_GID}" "$CONSOLE_HOME/Library/Application Support/SmartPinyin" 2>/dev/null || true
+  if [ "$CLEANUP_STAGED" -eq 1 ]; then
+    rm -rf -- "$STAGED_MODELS" 2>/dev/null || true
+    rmdir "/Library/Application Support/SmartPinyin" 2>/dev/null || true
+  fi
 fi
 
-# 在桌面用户会话中静默预拉起新版输入法，并打开图形化引导向导
+# 5. 在桌面用户会话中静默预拉起新版输入法，并打开图形化引导向导
 if [ -d "/Library/Input Methods/SmartPinyin.app" ]; then
   /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/open -g "/Library/Input Methods/SmartPinyin.app" >/dev/null 2>&1 || true
 fi

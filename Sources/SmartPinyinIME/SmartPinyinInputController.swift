@@ -21,6 +21,9 @@ public final class SmartPinyinInputController: IMKInputController {
     private static let sharedDocumentReader = DocumentContextReader()
     private static let sharedWorkingMemory = SessionWorkingMemory()
     private static let sharedTagStore = DomainAndLiteraryTagStore.loadBundled()
+    private static let sharedEnglishLexicon = EnglishLexiconStore.loadBundled(
+        rimeDataDirectory: Bundle.main.resourceURL?.appendingPathComponent("RimeData")
+    )
     private static let lexiconReloadQueue = DispatchQueue(label: "com.smartpinyin.lexiconReload", qos: .userInitiated)
     /// 进程内共享的「英文直出模式」开关：短按 Shift 切换后，在应用内切换输入框/窗格不会意外回弹为中文
     private static var isGlobalDirectEnglish = false
@@ -32,9 +35,11 @@ public final class SmartPinyinInputController: IMKInputController {
         memoryStore: Self.sharedMemoryStore,
         documentIndex: Self.sharedDocumentIndex,
         workingMemory: Self.sharedWorkingMemory,
-        tagStore: Self.sharedTagStore
+        tagStore: Self.sharedTagStore,
+        englishLexicon: Self.sharedEnglishLexicon
     )
     private let contextTracker = ContextTracker(maxLength: 2000)
+    private let proofreadValidator = DraftProofreadEngine()
 
     private var isActiveSession = false
     private var pendingShiftDownTime: CFAbsoluteTime?
@@ -46,10 +51,14 @@ public final class SmartPinyinInputController: IMKInputController {
     private var lastLanguageSwitchTime: CFAbsoluteTime = 0
     private var isCommittingTranslation = false
     private var commitTranslationStartedAt: CFAbsoluteTime = 0
+    private var nextAsyncCommitToken: UInt64 = 0
+    private var activeAsyncCommitToken: UInt64?
+    private var pendingAsyncCommitFallback: (text: String, client: IMKTextInput)?
     private var bufferedEventsDuringCommit: [NormalizedKeyEvent] = []
     private var commitTranslationTask: Task<Void, Never>?
     private var modeToastHideTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
+    private var proofreadDebounceTask: Task<Void, Never>?
     private var predictionTask: Task<Void, Never>?
     private var predictionAutoHideTask: Task<Void, Never>?
     private var mouseDownMonitor: Any?
@@ -178,6 +187,8 @@ public final class SmartPinyinInputController: IMKInputController {
         pendingOptionKeyCode = nil
         lastOptionTapTime = 0
         translateModeBeforeRightOptionTap = nil
+        activeAsyncCommitToken = nil
+        pendingAsyncCommitFallback = nil
         isCommittingTranslation = false
         commitTranslationStartedAt = 0
         bufferedEventsDuringCommit.removeAll()
@@ -252,6 +263,26 @@ public final class SmartPinyinInputController: IMKInputController {
                 let actions = self.stateMachine.commitCurrentOriginalChinese()
                 self.execute(actions: actions, client: client)
             }
+            CandidatePanelController.shared.onToggleSingleCharMode = { [weak self] in
+                guard let self, let client = self.client() else { return }
+                let actions = self.stateMachine.toggleSingleCharMode()
+                self.execute(actions: actions, client: client)
+            }
+            CandidatePanelController.shared.onToggleGlobalDraftScope = { [weak self] in
+                guard let self, let client = self.client() else { return }
+                let actions = self.stateMachine.toggleGlobalDraftScopeFromBar()
+                self.execute(actions: actions, client: client)
+            }
+            CandidatePanelController.shared.onCommitDraftProofread = { [weak self] in
+                guard let self, let client = self.client() else { return }
+                let actions = self.stateMachine.commitCurrentDraftProofread()
+                self.execute(actions: actions, client: client)
+            }
+            CandidatePanelController.shared.onCommitDraftOriginal = { [weak self] in
+                guard let self, let client = self.client() else { return }
+                let actions = self.stateMachine.commitCurrentDraftOriginal()
+                self.execute(actions: actions, client: client)
+            }
             CandidatePanelController.shared.onSelectPrediction = { [weak self] idx in
                 guard let self, let client = self.client() else { return }
                 self.predictionAutoHideTask?.cancel()
@@ -299,20 +330,45 @@ public final class SmartPinyinInputController: IMKInputController {
         }
     }
 
+    /// 异步收口（草稿 AI 纠偏 / 译文上屏）期间遭遇失焦、系统强制提交或熔断超时时，先将兜底文本落盘绝不丢字
+    @discardableResult
+    private func flushPendingAsyncCommitFallback(preferredClient: IMKTextInput?) -> Bool {
+        guard let pending = pendingAsyncCommitFallback else { return false }
+        activeAsyncCommitToken = nil
+        pendingAsyncCommitFallback = nil
+        isCommittingTranslation = false
+        commitTranslationStartedAt = 0
+        bufferedEventsDuringCommit.removeAll()
+        commitTranslationTask?.cancel()
+        commitTranslationTask = nil
+        let targetClient = preferredClient ?? pending.client
+        if !pending.text.isEmpty {
+            stateMachine.recordAsyncCommittedText(pending.text)
+            commitAtomically(text: pending.text, client: targetClient, requestPredictions: false)
+        } else {
+            clearMarkedText(client: targetClient)
+        }
+        return true
+    }
+
     public override func deactivateServer(_ sender: Any!) {
+        flushPendingAsyncCommitFallback(preferredClient: sender as? IMKTextInput)
         isActiveSession = false
         pendingShiftDownTime = nil
         pendingOptionDownTime = nil
         pendingOptionKeyCode = nil
         lastOptionTapTime = 0
         translateModeBeforeRightOptionTap = nil
+        activeAsyncCommitToken = nil
         isCommittingTranslation = false
         commitTranslationStartedAt = 0
+        pendingAsyncCommitFallback = nil
         bufferedEventsDuringCommit.removeAll()
         commitTranslationTask?.cancel()
         commitTranslationTask = nil
         modeToastHideTask?.cancel()
         debounceTask?.cancel()
+        proofreadDebounceTask?.cancel()
         predictionTask?.cancel()
         predictionAutoHideTask?.cancel()
         Self.diagLog("deactivate")
@@ -345,16 +401,26 @@ public final class SmartPinyinInputController: IMKInputController {
     }
 
     public override func commitComposition(_ sender: Any!) {
+        let targetClient = sender as? IMKTextInput
+        let flushedAsync = flushPendingAsyncCommitFallback(preferredClient: targetClient)
+        activeAsyncCommitToken = nil
         isCommittingTranslation = false
         commitTranslationStartedAt = 0
+        pendingAsyncCommitFallback = nil
         bufferedEventsDuringCommit.removeAll()
         commitTranslationTask?.cancel()
         commitTranslationTask = nil
-        guard let client = sender as? IMKTextInput else { return }
-        if let committed = Self.sharedEngine.commitComposition(), !committed.isEmpty {
-            commitAtomically(text: committed, client: client, requestPredictions: false)
-        } else {
-            clearMarkedText(client: client)
+        guard let client = targetClient else { return }
+        if !flushedAsync {
+            let actions = stateMachine.commitActiveCompositionOnSystemRequest()
+            let didCommit = actions.contains {
+                if case .commitText = $0 { return true }
+                return false
+            }
+            execute(actions: actions, client: client)
+            if !didCommit {
+                clearMarkedText(client: client)
+            }
         }
         let myOwner = ownerID
         performOnMainSync {
@@ -400,13 +466,18 @@ public final class SmartPinyinInputController: IMKInputController {
             let elapsed = CFAbsoluteTimeGetCurrent() - commitTranslationStartedAt
             if elapsed > 1.8 {
                 Self.diagLog("commitWatchdogReset elapsed=\(String(format: "%.2f", elapsed))s")
-                isCommittingTranslation = false
-                commitTranslationStartedAt = 0
-                bufferedEventsDuringCommit.removeAll()
-                commitTranslationTask?.cancel()
-                commitTranslationTask = nil
-                clearMarkedText(client: client)
+                if !flushPendingAsyncCommitFallback(preferredClient: client) {
+                    activeAsyncCommitToken = nil
+                    isCommittingTranslation = false
+                    commitTranslationStartedAt = 0
+                    bufferedEventsDuringCommit.removeAll()
+                    commitTranslationTask?.cancel()
+                    commitTranslationTask = nil
+                    clearMarkedText(client: client)
+                }
             } else if normalized.kind == .escape || isGlobalDisableTranslateShortcutEvent(normalized) {
+                activeAsyncCommitToken = nil
+                pendingAsyncCommitFallback = nil
                 isCommittingTranslation = false
                 commitTranslationStartedAt = 0
                 bufferedEventsDuringCommit.removeAll()
@@ -570,6 +641,21 @@ public final class SmartPinyinInputController: IMKInputController {
         )
         toggleTranslateItem.target = self
         menu.addItem(toggleTranslateItem)
+
+        let draftSpaceHint = currentPreferences.draftSpaceBehavior == .stageThenCommit
+            ? "空格进草稿·再按空格上屏"
+            : "回车上屏整句"
+        let draftBadge = currentPreferences.draftModeToggleShortcut.badge
+        let draftShortcutHint = draftBadge.isEmpty ? "" : " · \(draftBadge)"
+        let toggleDraftItem = NSMenuItem(
+            title: currentPreferences.defaultDraftProofreadMode
+                ? "✓ 整句暂存与校对模式（\(draftSpaceHint)\(draftShortcutHint)）"
+                : "开启整句暂存与校对模式\(draftBadge.isEmpty ? "" : "（\(draftBadge)）")",
+            action: #selector(menuToggleDraftProofreadMode(_:)),
+            keyEquivalent: ""
+        )
+        toggleDraftItem.target = self
+        menu.addItem(toggleDraftItem)
 
         menu.addItem(.separator())
 
@@ -800,6 +886,37 @@ public final class SmartPinyinInputController: IMKInputController {
         Self.diagLog("menuToggleTranslate enabled=\(willEnable) lang=\(updated.defaultTargetLanguage.rawValue)")
     }
 
+    @objc private func menuToggleDraftProofreadMode(_ sender: Any?) {
+        var updated = SmartPinyinPreferencesStore.load()
+        let willEnable = !updated.defaultDraftProofreadMode
+        updated.defaultDraftProofreadMode = willEnable
+        if willEnable {
+            updated.defaultTranslateMode = false
+            Self.isGlobalDirectEnglish = false
+        }
+        SmartPinyinPreferencesStore.save(updated)
+        currentPreferences = updated
+        Self.sharedEngine.applyPreferences(updated)
+        stateMachine.applyPreferences(updated)
+        let actions = stateMachine.setDraftProofreadMode(enabled: willEnable)
+        if let client = client() {
+            if stateMachine.hasActiveComposition {
+                execute(actions: actions, client: client)
+            } else {
+                let commitHint = updated.draftSpaceBehavior == .stageThenCommit
+                    ? "␣ 进草稿 · 再按 ␣ 上屏"
+                    : "␣ 拼句 · ⏎ 整体纠偏上屏"
+                showBriefModeToast(
+                    client: client,
+                    customMessage: willEnable
+                        ? "校 · 已开启整句暂存与校对模式（\(commitHint)）"
+                        : "中 · 已关闭整句暂存模式（恢复即打即上屏）"
+                )
+            }
+        }
+        Self.diagLog("menuToggleDraft enabled=\(willEnable)")
+    }
+
     @objc private func menuSelectLangEnglish(_ sender: Any?) { selectTargetLanguageFromMenu(.english) }
     @objc private func menuSelectLangJapanese(_ sender: Any?) { selectTargetLanguageFromMenu(.japanese) }
     @objc private func menuSelectLangKorean(_ sender: Any?) { selectTargetLanguageFromMenu(.korean) }
@@ -892,9 +1009,9 @@ public final class SmartPinyinInputController: IMKInputController {
     private func launchEmbeddedSetupHelper(arguments: [String], tabKey: String = "preferences") {
         let fm = FileManager.default
         let candidates = [
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/SmartPinyinSetup.app"),
             URL(fileURLWithPath: "/Applications/SmartPinyin Setup.app"),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/SmartPinyin Setup.app")
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/SmartPinyin Setup.app"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/SmartPinyinSetup.app")
         ]
         guard let helperURL = candidates.first(where: { fm.fileExists(atPath: $0.path) }) else { return }
         DistributedNotificationCenter.default().postNotificationName(
@@ -919,6 +1036,7 @@ public final class SmartPinyinInputController: IMKInputController {
 
             case .cancelPendingInference:
                 debounceTask?.cancel()
+                proofreadDebounceTask?.cancel()
                 performOnMainSync {
                     InferenceXPCClient.shared.cancelAll()
                 }
@@ -933,6 +1051,28 @@ public final class SmartPinyinInputController: IMKInputController {
                     showToast: !stateMachine.hasActiveComposition,
                     syncStateMachine: false
                 )
+
+            case .persistDraftProofreadMode(let enabled):
+                var updated = SmartPinyinPreferencesStore.load()
+                updated.defaultDraftProofreadMode = enabled
+                if enabled {
+                    updated.defaultTranslateMode = false
+                    Self.isGlobalDirectEnglish = false
+                }
+                SmartPinyinPreferencesStore.save(updated)
+                currentPreferences = updated
+                if !stateMachine.hasActiveComposition {
+                    let commitHint = updated.draftSpaceBehavior == .stageThenCommit
+                        ? "␣ 进草稿 · 再按 ␣ 上屏"
+                        : "␣ 拼句 · ⏎ 整体纠偏上屏"
+                    showBriefModeToast(
+                        client: client,
+                        customMessage: enabled
+                            ? "校 · 已开启整句暂存与校对模式（\(commitHint)）"
+                            : "中 · 已关闭整句暂存模式（恢复即打即上屏）"
+                    )
+                }
+                Self.diagLog("persistDraftMode enabled=\(enabled)")
 
             case .updateUI(let snapshot):
                 if snapshot.isVisible && !snapshot.preedit.isEmpty {
@@ -971,6 +1111,15 @@ public final class SmartPinyinInputController: IMKInputController {
                     commitTranslationAsync(sourceText: sourceText, target: target, client: client)
                 }
 
+            case .commitDraftProofreadAsync(let rawDraft, let aiSourceText, let fallbackText, let requestPredictions):
+                commitDraftProofreadAsync(
+                    rawDraft: rawDraft,
+                    aiSourceText: aiSourceText,
+                    fallbackText: fallbackText,
+                    requestPredictions: requestPredictions,
+                    client: client
+                )
+
             case .requestNeuralEnhancement(let token, let pinyin, let bestSentence, let candidates, let translationTarget):
                 scheduleNeuralEnhancement(
                     token: token,
@@ -980,6 +1129,41 @@ public final class SmartPinyinInputController: IMKInputController {
                     translationTarget: translationTarget,
                     client: client
                 )
+
+            case .requestDraftProofread(let token, let draftText):
+                scheduleDraftProofread(
+                    token: token,
+                    draftText: draftText,
+                    client: client
+                )
+            }
+        }
+    }
+
+    private func scheduleDraftProofread(
+        token: UInt64,
+        draftText: String,
+        client: IMKTextInput
+    ) {
+        proofreadDebounceTask?.cancel()
+        let leftContext = resolveLeftContext(client: client)
+        proofreadDebounceTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .milliseconds(280))
+            guard !Task.isCancelled, self.isActiveSession, self.stateMachine.sessionToken == token else { return }
+
+            let reply = await InferenceXPCClient.shared.proofreadSentence(
+                sourceText: draftText,
+                leftContext: leftContext
+            )
+            guard !Task.isCancelled, self.isActiveSession, self.stateMachine.sessionToken == token else { return }
+
+            if let uiAction = self.stateMachine.applyDraftProofreadResult(
+                reply,
+                forSourceText: draftText,
+                forToken: token
+            ) {
+                self.execute(actions: [uiAction], client: client)
             }
         }
     }
@@ -1072,10 +1256,93 @@ public final class SmartPinyinInputController: IMKInputController {
                 timeoutMs: 85
             ) {
                 guard !Task.isCancelled, self.isActiveSession, self.stateMachine.sessionToken == token else { return }
-                if let uiAction = self.stateMachine.applyRerankedScores(scored, forToken: token) {
-                    self.execute(actions: [uiAction], client: client)
+                let actions = self.stateMachine.applyRerankedScoresWithActions(scored, forToken: token)
+                if !actions.isEmpty {
+                    self.execute(actions: actions, client: client)
                 }
             }
+        }
+    }
+
+    private func commitDraftProofreadAsync(
+        rawDraft: String,
+        aiSourceText: String,
+        fallbackText: String,
+        requestPredictions: Bool,
+        client: IMKTextInput
+    ) {
+        let capturedToken = stateMachine.sessionToken
+        let leftContext = resolveLeftContext(client: client)
+        proofreadDebounceTask?.cancel()
+        nextAsyncCommitToken &+= 1
+        let commitToken = nextAsyncCommitToken
+        activeAsyncCommitToken = commitToken
+        isCommittingTranslation = true
+        commitTranslationStartedAt = CFAbsoluteTimeGetCurrent()
+        pendingAsyncCommitFallback = (text: fallbackText, client: client)
+        bufferedEventsDuringCommit.removeAll()
+        updateMarkedText("\(fallbackText) ⋯", client: client)
+
+        commitTranslationTask?.cancel()
+        commitTranslationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let reply = await InferenceXPCClient.shared.proofreadSentence(
+                sourceText: aiSourceText,
+                leftContext: leftContext,
+                timeoutSeconds: 0.45,
+                isCommitRequest: true
+            )
+            defer {
+                if self.activeAsyncCommitToken == commitToken {
+                    let queued = self.bufferedEventsDuringCommit
+                    self.bufferedEventsDuringCommit.removeAll()
+                    self.activeAsyncCommitToken = nil
+                    self.isCommittingTranslation = false
+                    self.commitTranslationStartedAt = 0
+                    self.commitTranslationTask = nil
+                    if self.isActiveSession, !queued.isEmpty {
+                        for (idx, ev) in queued.enumerated() {
+                            if self.isCommittingTranslation {
+                                self.bufferedEventsDuringCommit.append(contentsOf: queued[idx...])
+                                break
+                            }
+                            _ = self.processNormalizedEvent(ev, client: client)
+                        }
+                    }
+                }
+            }
+            guard !Task.isCancelled,
+                  self.activeAsyncCommitToken == commitToken,
+                  self.isActiveSession,
+                  self.stateMachine.sessionToken == capturedToken
+            else {
+                if self.activeAsyncCommitToken == commitToken {
+                    if let pending = self.pendingAsyncCommitFallback {
+                        self.pendingAsyncCommitFallback = nil
+                        self.stateMachine.recordAsyncCommittedText(pending.text)
+                        self.commitAtomically(text: pending.text, client: pending.client, requestPredictions: false)
+                    } else {
+                        self.clearMarkedText(client: client)
+                    }
+                }
+                return
+            }
+
+            self.pendingAsyncCommitFallback = nil
+            var finalText = fallbackText
+            if let reply, !reply.correctedText.isEmpty {
+                if let validated = self.proofreadValidator.validateAndBuildState(
+                    source: aiSourceText,
+                    candidateOutput: reply.correctedText,
+                    latencyMs: reply.latencyMs,
+                    backendLabel: reply.fromCache ? "缓存" : "AI"
+                ), case .suggested(_, let corrected, _, _, _, _) = validated, !corrected.isEmpty {
+                    finalText = corrected
+                }
+            }
+            _ = rawDraft
+            self.stateMachine.recordAsyncCommittedText(finalText)
+            self.commitAtomically(text: finalText, client: client, requestPredictions: requestPredictions)
         }
     }
 
@@ -1086,8 +1353,12 @@ public final class SmartPinyinInputController: IMKInputController {
     ) {
         let capturedToken = stateMachine.sessionToken
         let leftForSpacing = resolveLeftContext(client: client)
+        nextAsyncCommitToken &+= 1
+        let commitToken = nextAsyncCommitToken
+        activeAsyncCommitToken = commitToken
         isCommittingTranslation = true
         commitTranslationStartedAt = CFAbsoluteTimeGetCurrent()
+        pendingAsyncCommitFallback = (text: sourceText, client: client)
         bufferedEventsDuringCommit.removeAll()
         updateMarkedText("\(sourceText) ⋯", client: client)
 
@@ -1101,28 +1372,40 @@ public final class SmartPinyinInputController: IMKInputController {
                 isCommitRequest: true
             )
             defer {
-                let queued = self.bufferedEventsDuringCommit
-                self.bufferedEventsDuringCommit.removeAll()
-                self.isCommittingTranslation = false
-                self.commitTranslationStartedAt = 0
-                self.commitTranslationTask = nil
-                if self.isActiveSession, !queued.isEmpty {
-                    for (idx, ev) in queued.enumerated() {
-                        if self.isCommittingTranslation {
-                            self.bufferedEventsDuringCommit.append(contentsOf: queued[idx...])
-                            break
+                if self.activeAsyncCommitToken == commitToken {
+                    let queued = self.bufferedEventsDuringCommit
+                    self.bufferedEventsDuringCommit.removeAll()
+                    self.activeAsyncCommitToken = nil
+                    self.isCommittingTranslation = false
+                    self.commitTranslationStartedAt = 0
+                    self.commitTranslationTask = nil
+                    if self.isActiveSession, !queued.isEmpty {
+                        for (idx, ev) in queued.enumerated() {
+                            if self.isCommittingTranslation {
+                                self.bufferedEventsDuringCommit.append(contentsOf: queued[idx...])
+                                break
+                            }
+                            _ = self.processNormalizedEvent(ev, client: client)
                         }
-                        _ = self.processNormalizedEvent(ev, client: client)
                     }
                 }
             }
             guard !Task.isCancelled,
+                  self.activeAsyncCommitToken == commitToken,
                   self.isActiveSession,
                   self.stateMachine.sessionToken == capturedToken
             else {
-                self.clearMarkedText(client: client)
+                if self.activeAsyncCommitToken == commitToken {
+                    if let pending = self.pendingAsyncCommitFallback {
+                        self.pendingAsyncCommitFallback = nil
+                        self.commitAtomically(text: pending.text, client: pending.client, requestPredictions: false)
+                    } else {
+                        self.clearMarkedText(client: client)
+                    }
+                }
                 return
             }
+            self.pendingAsyncCommitFallback = nil
             let rawTranslated = (reply?.translatedText.isEmpty == false) ? reply!.translatedText : sourceText
             let finalText = TranslationSpacingHelper.formatForCommit(
                 translatedText: rawTranslated,
@@ -1154,7 +1437,7 @@ public final class SmartPinyinInputController: IMKInputController {
         guard requestPredictions,
               currentPreferences.enableContinuationPrediction,
               !secure,
-              stateMachine.mode == .chinesePinyin
+              (stateMachine.mode == .chinesePinyin || stateMachine.mode == .draftProofread)
         else { return }
 
         predictionTask?.cancel()
@@ -1596,6 +1879,10 @@ public final class SmartPinyinInputController: IMKInputController {
             switch stateMachine.mode {
             case .directEnglish: return "EN · 英文直出（短按 Shift 切回中文）"
             case .chinesePinyin: return "中 · 智能拼音"
+            case .draftProofread:
+                return currentPreferences.draftSpaceBehavior == .stageThenCommit
+                    ? "校 · 整句暂存与校对（␣ 进草稿 · 再按 ␣ 上屏）"
+                    : "校 · 整句暂存与校对（⏎ 上屏）"
             case .translateOnCommit(let lang): return "中→\(lang.shortBadge) · 实时翻译"
             }
         }()

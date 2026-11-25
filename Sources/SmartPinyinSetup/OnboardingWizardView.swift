@@ -218,9 +218,17 @@ struct OnboardingWizardView: View {
                     if let activeID = vm.downloadingModelID {
                         VStack(alignment: .leading, spacing: 4) {
                             ProgressView(value: vm.downloadProgress)
-                            Text("正在下载 \(activeID)：\(vm.downloadDetailText)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            HStack {
+                                Text("正在下载 \(activeID)：\(vm.downloadDetailText)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button("取消下载") {
+                                    vm.cancelModelDownload()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                            }
                         }
                         .padding(.top, 4)
                     }
@@ -282,7 +290,7 @@ struct OnboardingWizardView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("现场试打验收")
                 .font(.title2.bold())
-            Text("点击下方输入框，切换到 SmartPinyin 体验全拼/简拼（如输入 zgr、wsm）、以及按 Option+T 开启译文模式后输入中文直接回车出英文。")
+            Text("点击下方输入框，切换到 SmartPinyin 体验全拼/简拼（zgr、wsm）、中英混输与纠错（gitdiz → git地址、dokcer → Docker），以及单击右 Option 开启译文模式后输入中文直接回车出英文。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
@@ -299,11 +307,12 @@ struct OnboardingWizardView: View {
             GroupBox("核心快捷键速查") {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                     shortcutRow("短按 Shift", "中文拼音 / 英文直出快速切换")
-                    shortcutRow("Option + T", "开关「译文模式」（回车直接上屏英文/多语种）")
-                    shortcutRow("Option + L", "切换翻译目标语言（EN / JA / KO / FR / DE / ES）")
-                    shortcutRow("Shift + Return", "普通中文模式下临时将当前句一键译成英文")
-                    shortcutRow("/ja  /en  /ko ", "行内临时指定单句翻译语种")
-                    shortcutRow("Tab", "采纳本地小模型预测的联想续写词句")
+                    shortcutRow("中英混输 / 纠错", "直接敲 gitdiz → git地址、dokcer → Docker；大写/驼峰/下划线免切英文，错拼按 Tab 纠正")
+                    shortcutRow("右 Option 单击 / 双击", "空态 0ms 开关「译文模式」/ 弹出 1–6 语种直选（拼写时 Tab 切本句译文、⌃⌥T 全局关闭）")
+                    shortcutRow("⌃⌥D 或 /d", "开关「整句暂存校对模式」（先按空格进草稿自动纠偏，再按空格整句上屏）")
+                    shortcutRow("Shift + Return", "普通中文模式下临时将当前句一键译成英文上屏")
+                    shortcutRow("/ja  /en  /ko  /code", "行内快速指定单句翻译语种或切换中英标点风格")
+                    shortcutRow("1 / 2 / 3 或 Tab", "上屏后单手采纳本地小模型联想续写（继续打首字母 0ms 融入首位）")
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)

@@ -95,9 +95,14 @@ public final class SetupViewModel: ObservableObject {
     private let lexiconManager = LexiconManager()
     private var lexiconUpdatesByID: [String: LexiconUpdateInfo] = [:]
     private var pollTimer: Timer?
+    private var activeDownloadTask: Task<Void, Never>?
     private var isProbingAccessibility = false
     private var isSyncingPreferences = false
     private var notificationObservers: [NSObjectProtocol] = []
+
+    public var hasMultipleInstalledCopies: Bool {
+        (diskUsage?.installedAppPaths.count ?? 0) > 1
+    }
 
     public init(arguments: [String] = CommandLine.arguments) {
         self.hasEmbeddedPayload = (InstallerEngine.locateEmbeddedPayload() != nil)
@@ -332,13 +337,17 @@ public final class SetupViewModel: ObservableObject {
             return
         }
         errorMessage = nil
-        let status = InputSourceManager.registerAndEnable(bundleURL: path)
-        InputSourceManager.refreshSystemInputMenu()
-        inputSourceStatus = status
-        if status.isEnabled {
-            infoBanner = "SmartPinyin 输入源已成功注册并启用！"
-        } else {
-            infoBanner = "已向系统注册输入法。如系统未自动勾选，请点击下方按钮在「键盘 → 输入源」中点击「+」添加 SmartPinyin。"
+        infoBanner = "正在向系统注册并启用 SmartPinyin 输入源…"
+        Task { @MainActor [weak self] in
+            let status = await InputSourceManager.registerAndEnableAsync(bundleURL: path)
+            InputSourceManager.refreshSystemInputMenu()
+            guard let self else { return }
+            self.inputSourceStatus = status
+            if status.isEnabled {
+                self.infoBanner = "SmartPinyin 输入源已成功注册并启用！"
+            } else {
+                self.infoBanner = "已向系统注册输入法。如系统未自动勾选，请点击下方按钮在「键盘 → 输入源」中点击「+」添加 SmartPinyin。"
+            }
         }
     }
 
@@ -412,26 +421,41 @@ public final class SetupViewModel: ObservableObject {
         downloadProgress = 0
         downloadDetailText = "连接下载源…"
 
-        Task {
+        activeDownloadTask = Task { [weak self] in
+            guard let self else { return }
             do {
                 _ = try await provisioner.downloadModel(spec) { fraction, written, total in
                     Task { @MainActor [weak self] in
-                        self?.downloadProgress = fraction
+                        guard let self, self.downloadingModelID == spec.id else { return }
+                        self.downloadProgress = fraction
                         let w = InstallerEngine.formatBytes(written)
                         let t = total > 0 ? InstallerEngine.formatBytes(total) : "\(spec.expectedSizeMB) MB"
-                        self?.downloadDetailText = "\(w) / \(t) (\(Int(fraction * 100))%)"
+                        self.downloadDetailText = "\(w) / \(t) (\(Int(fraction * 100))%)"
                     }
                 }
+                self.activeDownloadTask = nil
                 self.downloadingModelID = nil
                 self.downloadDetailText = ""
-                self.infoBanner = "\(spec.displayName) 已下载并通过 GGUF 完整性校验。"
+                self.infoBanner = "\(spec.displayName) 已下载并通过 GGUF 完整性校验，无需重启即可生效。"
                 self.refreshAllState()
+            } catch is CancellationError {
+                self.activeDownloadTask = nil
+                self.downloadingModelID = nil
+                self.downloadProgress = 0
+                self.downloadDetailText = ""
+                self.infoBanner = "已取消 \(spec.displayName) 下载。"
             } catch {
+                self.activeDownloadTask = nil
                 self.downloadingModelID = nil
                 self.downloadDetailText = ""
                 self.errorMessage = error.localizedDescription
             }
         }
+    }
+
+    public func cancelModelDownload() {
+        activeDownloadTask?.cancel()
+        activeDownloadTask = nil
     }
 
     // MARK: - 词库动态管理与场景优先级
@@ -603,8 +627,8 @@ public final class SetupViewModel: ObservableObject {
                     self.progressMessage = ""
                     self.uninstallCompleted = true
                     self.refreshAllState()
-                    if !result.deferredSelfDeletePaths.isEmpty {
-                        self.infoBanner = "卸载已完成，2 秒后自动退出并清理卸载器自身。"
+                    if result.shouldTerminateAfterUninstall {
+                        self.infoBanner = "SmartPinyin 及系统组件已移除，2 秒后自动退出卸载器。"
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                             NSApplication.shared.terminate(nil)
                         }
@@ -624,11 +648,26 @@ public final class SetupViewModel: ObservableObject {
 
     private func startStatusPolling() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
+        // 仅在输入源开通/权限体检页且窗口活跃时低频轮询；其余时刻由 com.apple.accessibility.api 与 didBecomeActive 即时驱动，避免空转频繁 spawn 子进程
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, !self.isBusy, !self.uninstallCompleted else { return }
-                self.inputSourceStatus = InputSourceManager.currentStatus()
-                self.refreshAccessibilityAsync()
+                guard let self,
+                      !self.isBusy,
+                      !self.uninstallCompleted,
+                      NSApp.isActive
+                else { return }
+                let needsInputSourcePoll = (self.activeTab == .onboarding && self.step == .enableInputSource)
+                    || (self.activeTab == .status && !self.inputSourceStatus.isEnabled)
+                let needsAccessibilityPoll = !self.isAccessibilityTrusted && (
+                    (self.activeTab == .onboarding && self.step == .permissionsAndModels)
+                        || self.activeTab == .status
+                )
+                if needsInputSourcePoll {
+                    self.inputSourceStatus = InputSourceManager.currentStatus()
+                }
+                if needsAccessibilityPoll {
+                    self.refreshAccessibilityAsync()
+                }
             }
         }
     }

@@ -62,10 +62,29 @@ public struct UninstallOptions: Equatable, Sendable {
 public struct DiskUsageReport: Equatable, Sendable {
     public let inputMethodBytes: Int64
     public let setupAppBytes: Int64
+    public let preferencesAndLogsBytes: Int64
     public let userDictionaryBytes: Int64
     public let localModelsBytes: Int64
     public let installedAppPaths: [URL]
     public let installedSetupAppPaths: [URL]
+
+    public init(
+        inputMethodBytes: Int64,
+        setupAppBytes: Int64,
+        preferencesAndLogsBytes: Int64 = 0,
+        userDictionaryBytes: Int64,
+        localModelsBytes: Int64,
+        installedAppPaths: [URL],
+        installedSetupAppPaths: [URL]
+    ) {
+        self.inputMethodBytes = inputMethodBytes
+        self.setupAppBytes = setupAppBytes
+        self.preferencesAndLogsBytes = preferencesAndLogsBytes
+        self.userDictionaryBytes = userDictionaryBytes
+        self.localModelsBytes = localModelsBytes
+        self.installedAppPaths = installedAppPaths
+        self.installedSetupAppPaths = installedSetupAppPaths
+    }
 
     public var totalRemovableAppBytes: Int64 { inputMethodBytes + setupAppBytes }
 }
@@ -136,9 +155,13 @@ public struct DeletionPathValidator: Sendable {
             "\(baseHome)/Library/Application Support/SmartPinyin/Logs",
             "\(baseHome)/Library/Application Support/SmartPinyin/Models",
             "\(baseHome)/Library/Caches/\(SmartPinyinIdentifiers.appBundleID)",
+            "\(baseHome)/Library/Caches/\(SmartPinyinIdentifiers.appBundleID).Setup",
+            "\(baseHome)/Library/HTTPStorages/\(SmartPinyinIdentifiers.appBundleID)",
+            "\(baseHome)/Library/HTTPStorages/\(SmartPinyinIdentifiers.appBundleID).Setup",
             "\(baseHome)/Library/Preferences/\(SmartPinyinIdentifiers.appBundleID).plist",
             "\(baseHome)/Library/Preferences/\(SmartPinyinIdentifiers.appBundleID).Setup.plist",
             "/Library/Input Methods/SmartPinyin.app",
+            "/Library/Application Support/SmartPinyin/BundledModels",
             "/Applications/SmartPinyin Setup.app"
         ]
         if allowedExactPaths.contains(path) {
@@ -213,25 +236,31 @@ public final class InstallerEngine: @unchecked Sendable {
         return nil
     }
 
-    /// 扫描当前系统中已安装的 SmartPinyin 本体及各数据目录磁盘占用
+    /// 扫描当前系统中已安装的 SmartPinyin 本体及各数据目录磁盘占用（优先系统级路径在前）
     public func inspectDiskUsage() -> DiskUsageReport {
         let fm = FileManager.default
-        let imeCandidates = [userInputMethodURL, systemInputMethodURL].filter { fm.fileExists(atPath: $0.path) }
-        let setupCandidates = [userSetupAppURL, systemSetupAppURL].filter { fm.fileExists(atPath: $0.path) }
+        let imeCandidates = [systemInputMethodURL, userInputMethodURL].filter { fm.fileExists(atPath: $0.path) }
+        let setupCandidates = [systemSetupAppURL, userSetupAppURL].filter { fm.fileExists(atPath: $0.path) }
 
         let imeBytes = imeCandidates.reduce(Int64(0)) { $0 + Self.directorySize(at: $1) }
         let setupBytes = setupCandidates.reduce(Int64(0)) { $0 + Self.directorySize(at: $1) }
+        let prefsAndLogsBytes = Self.directorySize(at: appSupportDirectory.appendingPathComponent("Logs"))
+            + Self.directorySize(at: appSupportDirectory.appendingPathComponent("preferences.json"))
+            + Self.directorySize(at: homeDirectory.appendingPathComponent("Library/Caches/\(SmartPinyinIdentifiers.appBundleID)"))
+            + Self.directorySize(at: homeDirectory.appendingPathComponent("Library/Caches/\(SmartPinyinIdentifiers.appBundleID).Setup"))
+            + Self.directorySize(at: homeDirectory.appendingPathComponent("Library/HTTPStorages/\(SmartPinyinIdentifiers.appBundleID)"))
+            + Self.directorySize(at: homeDirectory.appendingPathComponent("Library/HTTPStorages/\(SmartPinyinIdentifiers.appBundleID).Setup"))
         let rimeDataBytes = Self.directorySize(at: appSupportDirectory.appendingPathComponent("RimeUserData"))
             + Self.directorySize(at: appSupportDirectory.appendingPathComponent("LexiconPacks"))
             + Self.directorySize(at: appSupportDirectory.appendingPathComponent("user_memory.sqlite3"))
             + Self.directorySize(at: appSupportDirectory.appendingPathComponent("user_memory.sqlite3-wal"))
             + Self.directorySize(at: appSupportDirectory.appendingPathComponent("user_memory.sqlite3-shm"))
-            + Self.directorySize(at: appSupportDirectory.appendingPathComponent("Logs"))
         let modelsBytes = Self.directorySize(at: appSupportDirectory.appendingPathComponent("Models"))
 
         return DiskUsageReport(
             inputMethodBytes: imeBytes,
             setupAppBytes: setupBytes,
+            preferencesAndLogsBytes: prefsAndLogsBytes,
             userDictionaryBytes: rimeDataBytes,
             localModelsBytes: modelsBytes,
             installedAppPaths: imeCandidates,
@@ -276,13 +305,27 @@ public final class InstallerEngine: @unchecked Sendable {
                 setupAppBundleURL: setupAppBundleURL,
                 destSetup: destSetup
             )
-            // 若旧版曾装在 ~/Library/Input Methods/ 下，先注销 LaunchServices 再移除重复副本，防止沙盒化系统设置读到旧路径
+            // 若旧版曾装在 ~/Library/Input Methods/ 或 ~/Applications/ 下，先注销 LaunchServices 再移除重复副本，防止系统设置与启动台冲突
             if fm.fileExists(atPath: userInputMethodURL.path),
                userInputMethodURL.standardizedFileURL != destIME.standardizedFileURL {
                 unregisterLaunchServices(for: userInputMethodURL)
                 try? fm.removeItem(at: userInputMethodURL)
             }
+            if fm.fileExists(atPath: userSetupAppURL.path),
+               userSetupAppURL.standardizedFileURL != destSetup.standardizedFileURL {
+                unregisterLaunchServices(for: userSetupAppURL)
+                try? fm.removeItem(at: userSetupAppURL)
+            }
         } else {
+            // 若已存在系统级副本而用户切换到当前用户级安装，阻断双副本共存并明确指引
+            if !skipSystemIntegration,
+               scope == .currentUser,
+               fm.fileExists(atPath: systemInputMethodURL.path),
+               systemInputMethodURL.standardizedFileURL != destIME.standardizedFileURL {
+                throw InstallerEngineError.fileOperationFailed(
+                    "检测到系统目录已存在 \(systemInputMethodURL.path)。为避免输入法双副本冲突，请选择「为所有用户安装」覆盖升级，或先卸载旧版后再安装至当前用户目录。"
+                )
+            }
             try fm.createDirectory(at: targetIMEDir, withIntermediateDirectories: true)
             try atomicReplaceBundle(from: payloadAppURL, to: destIME)
             clearQuarantineIfNeeded(at: destIME)
@@ -305,7 +348,12 @@ public final class InstallerEngine: @unchecked Sendable {
             )
             for item in provisioner.inspectAll() {
                 if case .discoverable(let src, _) = item.availability {
-                    _ = try? provisioner.importModel(from: src, for: item.spec, preferSymlink: false)
+                    onProgress?(LifecycleProgress(step: 3, totalSteps: 4, message: "正在导入内置离线模型：\(item.spec.displayName)…"))
+                    do {
+                        _ = try provisioner.importModel(from: src, for: item.spec, preferSymlink: false)
+                    } catch {
+                        throw InstallerEngineError.fileOperationFailed("内置模型 \(item.spec.displayName) 导入失败：\(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -324,11 +372,28 @@ public final class InstallerEngine: @unchecked Sendable {
     }
 
     /// 6 步零残留自卸载流水线。
-    /// 返回是否需要触发脱离会话的自删脚本（以及脚本路径，便于测试和上层在退出前执行）。
+    /// 返回已删除路径、需要退出后清理的用户级自删路径，以及卸载完成后是否应自动退出当前进程。
     public struct UninstallResult: Equatable, Sendable {
         public let removedPaths: [URL]
         public let deferredSelfDeletePaths: [URL]
         public let selfDeleteScriptURL: URL?
+        public let removedCurrentProcessBundle: Bool
+
+        public var shouldTerminateAfterUninstall: Bool {
+            removedCurrentProcessBundle || !deferredSelfDeletePaths.isEmpty
+        }
+
+        public init(
+            removedPaths: [URL],
+            deferredSelfDeletePaths: [URL],
+            selfDeleteScriptURL: URL?,
+            removedCurrentProcessBundle: Bool = false
+        ) {
+            self.removedPaths = removedPaths
+            self.deferredSelfDeletePaths = deferredSelfDeletePaths
+            self.selfDeleteScriptURL = selfDeleteScriptURL
+            self.removedCurrentProcessBundle = removedCurrentProcessBundle
+        }
     }
 
     public func uninstall(
@@ -340,26 +405,20 @@ public final class InstallerEngine: @unchecked Sendable {
         let fm = FileManager.default
         let currentPath = currentProcessBundleURL?.standardizedFileURL.path
 
-        onProgress?(LifecycleProgress(step: 1, totalSteps: 6, message: "正在切换回系统英文键盘并禁用输入源…"))
-        if !skipSystemIntegration {
-            InputSourceManager.disableAllAndSwitchToSafeKeyboard()
-        }
-
-        onProgress?(LifecycleProgress(step: 2, totalSteps: 6, message: "正在停止 SmartPinyin 与推理服务进程…"))
-        if !skipSystemIntegration {
-            terminateIMEProcesses()
-        }
-
-        onProgress?(LifecycleProgress(step: 3, totalSteps: 6, message: "正在收集待清理目录并执行安全白名单校验…"))
+        onProgress?(LifecycleProgress(step: 1, totalSteps: 6, message: "正在收集待清理目录并执行安全白名单校验…"))
         var candidateTargets: [URL] = [
             userInputMethodURL,
             systemInputMethodURL,
             userSetupAppURL,
-            systemSetupAppURL
+            systemSetupAppURL,
+            URL(fileURLWithPath: "/Library/Application Support/SmartPinyin/BundledModels", isDirectory: true)
         ]
 
         if options.removePreferencesAndLogs {
             candidateTargets.append(homeDirectory.appendingPathComponent("Library/Caches/\(SmartPinyinIdentifiers.appBundleID)"))
+            candidateTargets.append(homeDirectory.appendingPathComponent("Library/Caches/\(SmartPinyinIdentifiers.appBundleID).Setup"))
+            candidateTargets.append(homeDirectory.appendingPathComponent("Library/HTTPStorages/\(SmartPinyinIdentifiers.appBundleID)"))
+            candidateTargets.append(homeDirectory.appendingPathComponent("Library/HTTPStorages/\(SmartPinyinIdentifiers.appBundleID).Setup"))
             candidateTargets.append(homeDirectory.appendingPathComponent("Library/Preferences/\(SmartPinyinIdentifiers.appBundleID).plist"))
             candidateTargets.append(homeDirectory.appendingPathComponent("Library/Preferences/\(SmartPinyinIdentifiers.appBundleID).Setup.plist"))
             candidateTargets.append(appSupportDirectory.appendingPathComponent("preferences.json"))
@@ -391,31 +450,41 @@ public final class InstallerEngine: @unchecked Sendable {
             }
         }
 
-        // 区分“立即删除”与“包含当前运行中进程自身，需退出后延迟自删”的路径
+        // 区分系统级特权路径（在 UI 存活期间同步单次提权删除，用户取消可无损中止）与用户级路径（仅运行中的用户级 App 走无密码延迟自删）
         var immediateUserPaths: [URL] = []
         var immediatePrivilegedPaths: [URL] = []
         var deferredSelfPaths: [URL] = []
+        var privilegedContainsCurrentProcess = false
 
         for url in existingValidated {
             let p = url.path
-            if let cur = currentPath, (cur == p || cur.hasPrefix(p + "/")) {
-                deferredSelfPaths.append(url)
-            } else if p.hasPrefix("/Library/") || p.hasPrefix("/Applications/") {
+            let isPrivileged = p.hasPrefix("/Library/") || p.hasPrefix("/Applications/")
+            let containsCurrent = currentPath.map { $0 == p || $0.hasPrefix(p + "/") } ?? false
+            if isPrivileged {
                 immediatePrivilegedPaths.append(url)
+                if containsCurrent {
+                    privilegedContainsCurrentProcess = true
+                }
+            } else if containsCurrent {
+                deferredSelfPaths.append(url)
             } else {
                 immediateUserPaths.append(url)
             }
         }
 
-        onProgress?(LifecycleProgress(step: 4, totalSteps: 6, message: "正在移除输入法文件与缓存…"))
-        var removed: [URL] = []
-        for url in immediateUserPaths {
-            if fm.fileExists(atPath: url.path) {
-                try fm.removeItem(at: url)
-                removed.append(url)
+        let intactIMEBeforeUninstall = [systemInputMethodURL, userInputMethodURL].first { fm.fileExists(atPath: $0.path) }
+
+        onProgress?(LifecycleProgress(step: 2, totalSteps: 6, message: "正在切换回系统英文键盘并停止输入法进程…"))
+        if !skipSystemIntegration {
+            InputSourceManager.disableAllAndSwitchToSafeKeyboard()
+            terminateIMEProcesses()
+            for url in existingValidated where url.pathExtension == "app" {
+                unregisterLaunchServices(for: url)
             }
         }
 
+        var removed: [URL] = []
+        onProgress?(LifecycleProgress(step: 3, totalSteps: 6, message: "正在移除系统级输入法组件…"))
         if !immediatePrivilegedPaths.isEmpty {
             if skipSystemIntegration {
                 for url in immediatePrivilegedPaths where fm.fileExists(atPath: url.path) {
@@ -423,26 +492,47 @@ public final class InstallerEngine: @unchecked Sendable {
                     removed.append(url)
                 }
             } else {
-                try removeWithAdminPrivileges(paths: immediatePrivilegedPaths)
-                removed.append(contentsOf: immediatePrivilegedPaths)
+                do {
+                    try removeWithAdminPrivileges(paths: immediatePrivilegedPaths)
+                    removed.append(contentsOf: immediatePrivilegedPaths)
+                } catch {
+                    // 用户取消管理员授权或提权失败：用户词库/模型/偏好尚未触动，恢复原输入法注册与拉起，防止进入半卸载损坏态！
+                    if let intactIME = intactIMEBeforeUninstall, fm.fileExists(atPath: intactIME.path) {
+                        refreshLaunchServices(for: intactIME)
+                        _ = InputSourceManager.registerAndEnable(bundleURL: intactIME)
+                        runSilentProcess("/usr/bin/open", arguments: ["-g", intactIME.path])
+                    }
+                    throw error
+                }
             }
         }
 
-        onProgress?(LifecycleProgress(step: 5, totalSteps: 6, message: "正在清理系统偏好设置…"))
-        if options.removePreferencesAndLogs && !skipSystemIntegration {
-            runSilentProcess("/usr/bin/defaults", arguments: ["delete", SmartPinyinIdentifiers.appBundleID])
-            runSilentProcess("/usr/bin/defaults", arguments: ["delete", "\(SmartPinyinIdentifiers.appBundleID).Setup"])
+        onProgress?(LifecycleProgress(step: 4, totalSteps: 6, message: "正在移除用户级文件与缓存…"))
+        for url in immediateUserPaths {
+            if fm.fileExists(atPath: url.path) {
+                try fm.removeItem(at: url)
+                removed.append(url)
+            }
         }
 
-        onProgress?(LifecycleProgress(step: 6, totalSteps: 6, message: "正在准备安全自清理并完成卸载…"))
+        onProgress?(LifecycleProgress(step: 5, totalSteps: 6, message: "正在清理系统偏好与权限缓存…"))
+        if !skipSystemIntegration {
+            if options.removePreferencesAndLogs {
+                runSilentProcess("/usr/bin/defaults", arguments: ["delete", SmartPinyinIdentifiers.appBundleID])
+                runSilentProcess("/usr/bin/defaults", arguments: ["delete", "\(SmartPinyinIdentifiers.appBundleID).Setup"])
+            }
+            // 尽力清理辅助功能 TCC 残留条目（受系统权限限制时静默容错）
+            runSilentProcess("/usr/bin/tccutil", arguments: ["reset", "Accessibility", SmartPinyinIdentifiers.appBundleID])
+        }
+
+        onProgress?(LifecycleProgress(step: 6, totalSteps: 6, message: "正在刷新输入法缓存并完成卸载…"))
         if !skipSystemIntegration {
             clearStaleIntlDataCaches()
             refreshTextInputMenuAgent(launchingIMEAt: nil)
         }
         var scriptURL: URL?
         if !deferredSelfPaths.isEmpty {
-            let needsAdmin = deferredSelfPaths.contains { $0.path.hasPrefix("/Library/") || $0.path.hasPrefix("/Applications/") }
-            let script = try createSelfDeleteScript(targets: deferredSelfPaths, requiresAdmin: needsAdmin && !skipSystemIntegration)
+            let script = try createSelfDeleteScript(targets: deferredSelfPaths, requiresAdmin: false)
             scriptURL = script
             if launchDeferredScript && !skipSystemIntegration {
                 try spawnDetachedSelfDelete(scriptURL: script)
@@ -452,7 +542,8 @@ public final class InstallerEngine: @unchecked Sendable {
         return UninstallResult(
             removedPaths: removed,
             deferredSelfDeletePaths: deferredSelfPaths,
-            selfDeleteScriptURL: scriptURL
+            selfDeleteScriptURL: scriptURL,
+            removedCurrentProcessBundle: privilegedContainsCurrentProcess
         )
     }
 
@@ -482,7 +573,7 @@ public final class InstallerEngine: @unchecked Sendable {
 
         if requiresAdmin {
             let quotedTargets = targets.map { Self.shellSingleQuote($0.standardizedFileURL.path) }.joined(separator: " ")
-            let cmd = "rm -rf -- \(quotedTargets)"
+            let cmd = "rm -rf -- \(quotedTargets) && { rm -f /System/Library/Caches/com.apple.IntlDataCache* 2>/dev/null || true; }"
             let escapedForAppleScript = cmd
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
@@ -516,6 +607,16 @@ public final class InstallerEngine: @unchecked Sendable {
     private func terminateIMEProcesses() {
         runSilentProcess("/usr/bin/pkill", arguments: ["-x", "SmartPinyin"])
         runSilentProcess("/usr/bin/pkill", arguments: ["-x", "SmartPinyinInference"])
+        // 关闭除当前进程之外的其他 SmartPinyin Setup 实例（如从 DMG 覆盖升级或卸载时，避免后台旧 Setup 窗口驻留）
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let setupApps = NSRunningApplication.runningApplications(
+            withBundleIdentifier: "\(SmartPinyinIdentifiers.appBundleID).Setup"
+        )
+        for app in setupApps where app.processIdentifier != myPID {
+            if !app.terminate() {
+                _ = app.forceTerminate()
+            }
+        }
         Thread.sleep(forTimeInterval: 0.25)
     }
 
@@ -556,7 +657,13 @@ public final class InstallerEngine: @unchecked Sendable {
 
     private func removeWithAdminPrivileges(paths: [URL]) throws {
         let quoted = paths.map { Self.shellSingleQuote($0.standardizedFileURL.path) }.joined(separator: " ")
-        try runPrivilegedShell("rm -rf -- \(quoted)")
+        let cmd = [
+            "rm -rf -- \(quoted)",
+            "{ rmdir '/Library/Application Support/SmartPinyin' 2>/dev/null || true; }",
+            "{ rm -f /System/Library/Caches/com.apple.IntlDataCache* 2>/dev/null || true; }",
+            "{ /usr/sbin/pkgutil --forget com.smartpinyin.inputmethod.SmartPinyin.pkg 2>/dev/null || true; }"
+        ].joined(separator: " && ")
+        try runPrivilegedShell(cmd)
     }
 
     private func runPrivilegedShell(_ shellCommand: String) throws {
@@ -644,11 +751,10 @@ public final class InstallerEngine: @unchecked Sendable {
     }
 
     private func refreshTextInputMenuAgent(launchingIMEAt bundleURL: URL? = nil, restartIMKAgent: Bool = true) {
+        // 绝不强杀 imklaunchagent，避免打断其他正在使用输入法的终端/编辑器连接；仅温和刷新菜单栏输入源代理
+        InputSourceManager.invalidateUIOrderCache()
         if restartIMKAgent {
-            runSilentProcess("/usr/bin/pkill", arguments: ["-x", "imklaunchagent"])
             runSilentProcess("/usr/bin/pkill", arguments: ["-x", "TextInputMenuAgent"])
-            runSilentProcess("/usr/bin/pkill", arguments: ["-9", "-x", "TextInputSwitcher"])
-            runSilentProcess("/usr/bin/pkill", arguments: ["-9", "-x", "CursorUIViewService"])
         }
         if let bundleURL, FileManager.default.fileExists(atPath: bundleURL.path) {
             Thread.sleep(forTimeInterval: 0.25)

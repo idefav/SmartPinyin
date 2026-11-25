@@ -17,6 +17,8 @@ public struct InferenceBudgetConfig: Sendable {
     public let lightModelPath: String
     /// 专职翻译模型路径（HY-MT1.5-1.8B-Q4_K_M / IQ4_XS）
     public let translationModelPath: String
+    /// 当初始配置路径尚未存在时，是否在运行时动态重新探测默认模型目录（支持 Lite 安装包先装后下模型即刻生效）
+    public let autoRediscoverMissingModels: Bool
 
     public init(
         memoryBudgetMB: Double = 1750.0,
@@ -25,7 +27,8 @@ public struct InferenceBudgetConfig: Sendable {
         gpuLayers: Int32 = 99,
         idleUnloadSeconds: TimeInterval = 180,
         lightModelPath: String,
-        translationModelPath: String
+        translationModelPath: String,
+        autoRediscoverMissingModels: Bool = false
     ) {
         self.memoryBudgetMB = memoryBudgetMB
         self.contextSize = contextSize
@@ -34,19 +37,29 @@ public struct InferenceBudgetConfig: Sendable {
         self.idleUnloadSeconds = idleUnloadSeconds
         self.lightModelPath = lightModelPath
         self.translationModelPath = translationModelPath
+        self.autoRediscoverMissingModels = autoRediscoverMissingModels
     }
 
-    /// 自动探测默认模型路径（优先环境变量 -> 项目 Models 目录 -> Application Support）
-    public static func defaultConfig(projectModelsDir: String? = nil) -> InferenceBudgetConfig {
+    /// 自动探测默认模型路径（优先环境变量 -> 项目 Models 目录 -> Application Support -> Bundle -> 当前工作目录）
+    /// 若所有目录暂未找到模型（例如轻量安装包尚未下载权重），固定回落到标准 Application Support/SmartPinyin/Models 目录，
+    /// 绝不回落到只读的 XPC Bundle 内部路径，确保下载完成后无需重启即可生效。
+    public static func defaultConfig(
+        projectModelsDir: String? = nil,
+        appSupportModelsDir: String? = nil,
+        workingDirectory: String? = nil
+    ) -> InferenceBudgetConfig {
         let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("SmartPinyin/Models").path ?? ""
+        let appSupport = appSupportModelsDir
+            ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("SmartPinyin/Models").path
+            ?? ""
+        let cwd = workingDirectory ?? fm.currentDirectoryPath
         let candidates = [
             ProcessInfo.processInfo.environment["SMARTPINYIN_MODELS_DIR"],
             projectModelsDir,
-            Bundle.main.resourceURL?.appendingPathComponent("Models").path,
             appSupport,
-            FileManager.default.currentDirectoryPath + "/Models"
+            Bundle.main.resourceURL?.appendingPathComponent("Models").path,
+            cwd.isEmpty ? nil : (cwd as NSString).appendingPathComponent("Models")
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         func locate(_ filenames: [String]) -> String {
@@ -58,14 +71,16 @@ public struct InferenceBudgetConfig: Sendable {
                     }
                 }
             }
-            return (candidates.first ?? appSupport) + "/" + filenames[0]
+            let fallbackBase = !appSupport.isEmpty ? appSupport : (candidates.first ?? "")
+            return (fallbackBase as NSString).appendingPathComponent(filenames[0])
         }
 
         let prefs = SmartPinyinPreferencesStore.load()
         return InferenceBudgetConfig(
             idleUnloadSeconds: TimeInterval(prefs.idleUnloadSeconds),
             lightModelPath: locate(["Qwen3-0.6B-Q4_K_M.gguf", "Qwen3-0.6B-IQ4_XS.gguf", "suzu-40m.gguf"]),
-            translationModelPath: locate(["HY-MT1.5-1.8B-Q4_K_M.gguf", "HY-MT1.5-1.8B.IQ4_XS.gguf"])
+            translationModelPath: locate(["HY-MT1.5-1.8B-Q4_K_M.gguf", "HY-MT1.5-1.8B.IQ4_XS.gguf"]),
+            autoRediscoverMissingModels: true
         )
     }
 }

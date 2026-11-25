@@ -50,12 +50,22 @@ public enum InputAction: Equatable, Sendable {
         target: TargetLanguage,
         cachedTranslation: String?
     )
+    case commitDraftProofreadAsync(
+        rawDraft: String,
+        aiSourceText: String,
+        fallbackText: String,
+        requestPredictions: Bool
+    )
     case requestNeuralEnhancement(
         sessionToken: UInt64,
         pinyin: String,
         bestSentence: String,
         candidates: [String],
         translationTarget: TargetLanguage?
+    )
+    case requestDraftProofread(
+        sessionToken: UInt64,
+        draftText: String
     )
     case cancelPendingInference
     case persistPreferencesChange(
@@ -64,6 +74,7 @@ public enum InputAction: Equatable, Sendable {
         codingMode: Bool?,
         chinesePunctuation: Bool?
     )
+    case persistDraftProofreadMode(Bool)
 }
 
 /// 输入法核心状态机：
@@ -91,10 +102,13 @@ public final class InputStateMachine {
     private let documentIndex: DocumentContextIndex?
     private let workingMemory: SessionWorkingMemory?
     private let tagStore: DomainAndLiteraryTagStore?
+    private let englishLexicon: EnglishLexiconStore
     private let sceneDetector = SceneContextDetector()
     private let ranker: CandidateFusionRanker
     private let pinyinNormalizer = PinyinNormalizer()
     private let typoCorrector = PinyinTypoCorrector()
+    private let mixedBilingualComposer: MixedBilingualComposer
+    private let proofreadEngine = DraftProofreadEngine()
     private let clock: () -> TimeInterval
 
     public private(set) var mode: InputMode = .chinesePinyin
@@ -127,6 +141,18 @@ public final class InputStateMachine {
 
     /// 翻译模式下通过数字键 1-9 分段选词纠错后暂存的中文句缓冲（尚未上屏，实时驱动翻译栏）
     private var composedChineseBuffer: String = ""
+    /// 整句暂存与校对模式下拼接的整句草稿缓冲（选词/标点/中英混输均暂存于此，校对后回车一次上屏）
+    private var draftChineseBuffer: String = ""
+    /// 记录每次追加到 draftChineseBuffer 的词段字符数，支持 Option+Backspace 整词段回删
+    private var draftSegmentLengths: [Int] = []
+    /// 整句校对预览状态（L1 规则预检 + L2 Qwen3-0.6B 语义纠偏）
+    private var draftProofreadState: DraftProofreadState = .idle
+    /// 正在等待异步 AI 校对返回的输入文本（非空代表 L2 尚未回包，此时回车将触发短超时即时收口避免漏纠）
+    private var pendingAIDraftSourceText: String?
+    /// 本句临时整句暂存开关覆盖（nil 跟随全局 mode；true 本句启用；false 本句临时关闭）
+    private var inlineDraftOverride: Bool?
+    /// 超长/无候选兜底或手动 ⌥C 进入的单字逐个选择会话
+    private var singleCharSession: SingleCharProgressiveSession?
     /// 当前页经融合排序（或 L2 神经重排）后的候选条目，保留 originalRimeIndex / globalRimeIndex 以便准确回写 Rime 用户词库
     private var rankedItems: [RankedCandidateItem] = []
     /// 第 1 页从深层 Top-16 召回池捞上首页展示过的候选词（翻到第 2 页时自动去重）
@@ -149,6 +175,7 @@ public final class InputStateMachine {
         documentIndex: DocumentContextIndex? = nil,
         workingMemory: SessionWorkingMemory? = nil,
         tagStore: DomainAndLiteraryTagStore? = nil,
+        englishLexicon: EnglishLexiconStore = .shared,
         ranker: CandidateFusionRanker = CandidateFusionRanker(),
         clock: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 }
     ) {
@@ -158,12 +185,18 @@ public final class InputStateMachine {
         self.documentIndex = documentIndex
         self.workingMemory = workingMemory
         self.tagStore = tagStore
+        self.englishLexicon = englishLexicon
+        self.mixedBilingualComposer = MixedBilingualComposer(lexicon: englishLexicon, normalizer: pinyinNormalizer)
         self.ranker = ranker
         self.clock = clock
         self.preferredTargetLanguage = preferences.defaultTargetLanguage
-        self.mode = preferences.defaultTranslateMode
-            ? .translateOnCommit(preferences.defaultTargetLanguage)
-            : .chinesePinyin
+        if preferences.defaultTranslateMode {
+            self.mode = .translateOnCommit(preferences.defaultTargetLanguage)
+        } else if preferences.defaultDraftProofreadMode {
+            self.mode = .draftProofread
+        } else {
+            self.mode = .chinesePinyin
+        }
     }
 
     /// 词库或用户自定义领域标签热更新后调用：刷新侧车领域索引并重置场景迟滞缓存
@@ -200,16 +233,29 @@ public final class InputStateMachine {
         isLanguagePickerOpen
     }
 
+    /// 当前是否处于单字逐选模式
+    public var isSingleCharModeActive: Bool {
+        singleCharSession != nil
+    }
+
     private var effectiveTranslationTarget: TargetLanguage? {
         if let override = inlineOverrideTarget { return override }
         if suppressTranslateForCurrentSentence { return nil }
         return mode.translationTarget
     }
 
-    /// 实时应用最新偏好设置（持久化的翻译模式开关跨窗口/App 始终生效）
+    /// 当前是否处于「整句暂存与校对」生效态（与翻译模式互斥，翻译优先）
+    private var effectiveDraftModeActive: Bool {
+        guard effectiveTranslationTarget == nil else { return false }
+        if let override = inlineDraftOverride { return override }
+        return mode.isDraftProofread
+    }
+
+    /// 实时应用最新偏好设置（持久化的翻译模式与整句暂存校对模式跨窗口/App 始终生效）
     public func applyPreferences(_ newPreferences: SmartPinyinPreferences) {
         let oldLang = preferences.defaultTargetLanguage
         let oldDefaultTranslate = preferences.defaultTranslateMode
+        let oldDefaultDraft = preferences.defaultDraftProofreadMode
         if newPreferences.traditionalChinese != preferences.traditionalChinese
             || newPreferences.fuzzyNasalPinyin != preferences.fuzzyNasalPinyin
             || newPreferences.fuzzyRetroflexPinyin != preferences.fuzzyRetroflexPinyin
@@ -217,6 +263,7 @@ public final class InputStateMachine {
             typoProbeCache.removeAll(keepingCapacity: true)
         }
         preferences = newPreferences
+        singleCharSession?.updatePageSize(newPreferences.candidatePageSize)
 
         if newPreferences.defaultTargetLanguage != oldLang
             || newPreferences.defaultTargetLanguage != preferredTargetLanguage {
@@ -229,8 +276,20 @@ public final class InputStateMachine {
             if newPreferences.defaultTranslateMode {
                 mode = .translateOnCommit(preferredTargetLanguage)
             } else if case .translateOnCommit = mode {
-                mode = .chinesePinyin
+                mode = newPreferences.defaultDraftProofreadMode ? .draftProofread : .chinesePinyin
                 translationPreview = .hidden
+            }
+        }
+        if newPreferences.defaultDraftProofreadMode != oldDefaultDraft {
+            if case .directEnglish = mode {
+                // 英文直出态下保留英文模式，切回中文时自动应用新偏好
+            } else if case .translateOnCommit = mode {
+                // 翻译优先，退出翻译后自动落入新偏好
+            } else {
+                mode = newPreferences.defaultDraftProofreadMode ? .draftProofread : .chinesePinyin
+                if !newPreferences.defaultDraftProofreadMode {
+                    draftProofreadState = .idle
+                }
             }
         }
         if !newPreferences.enableContinuationPrediction {
@@ -243,12 +302,149 @@ public final class InputStateMachine {
         suppressTranslateForCurrentSentence = false
         inlineOverrideTarget = nil
         if enabled {
+            if !draftChineseBuffer.isEmpty {
+                composedChineseBuffer.append(draftChineseBuffer)
+                draftChineseBuffer = ""
+                draftSegmentLengths = []
+                draftProofreadState = .idle
+                pendingAIDraftSourceText = nil
+            }
             mode = .translateOnCommit(preferredTargetLanguage)
         } else {
-            mode = .chinesePinyin
+            mode = preferences.defaultDraftProofreadMode ? .draftProofread : .chinesePinyin
             translationPreview = .hidden
+            if mode.isDraftProofread && !composedChineseBuffer.isEmpty {
+                appendToDraftBuffer(composedChineseBuffer)
+                composedChineseBuffer = ""
+            }
         }
         return refreshAfterModeChange()
+    }
+
+    /// 显式切换全局「整句暂存与校对模式」（菜单/快捷键/行内指令调用）
+    public func setDraftProofreadMode(enabled: Bool) -> [InputAction] {
+        inlineDraftOverride = nil
+        preferences.defaultDraftProofreadMode = enabled
+        if enabled {
+            if case .directEnglish = mode {
+                mode = .draftProofread
+            } else if case .translateOnCommit = mode {
+                // 显式开启校对暂存时退出翻译模式，保留已有中文缓冲无损迁移到草稿区
+                preferences.defaultTranslateMode = false
+                suppressTranslateForCurrentSentence = false
+                inlineOverrideTarget = nil
+                translationPreview = .hidden
+                if !composedChineseBuffer.isEmpty {
+                    appendToDraftBuffer(composedChineseBuffer)
+                    composedChineseBuffer = ""
+                }
+                mode = .draftProofread
+            } else {
+                mode = .draftProofread
+            }
+        } else {
+            if case .draftProofread = mode {
+                mode = .chinesePinyin
+            }
+            draftProofreadState = .idle
+            pendingAIDraftSourceText = nil
+            let snap = engine.currentSnapshot()
+            if !snap.isComposing && singleCharSession == nil && !draftChineseBuffer.isEmpty {
+                let pending = draftChineseBuffer
+                draftChineseBuffer = ""
+                draftSegmentLengths = []
+                return [.cancelPendingInference, .updateUI(.empty), .commitText(text: pending, requestPredictions: false)]
+            }
+        }
+        return refreshAfterModeChange()
+    }
+
+    /// 校对底栏「本句 / 全局」作用域胶囊点击：切换持久全局校对模式与本句临时态
+    public func toggleGlobalDraftScopeFromBar() -> [InputAction] {
+        let isCurrentlyGlobal = (mode.isDraftProofread && inlineDraftOverride != false)
+        let nextGlobal = !isCurrentlyGlobal
+        let actions = setDraftProofreadMode(enabled: nextGlobal)
+        return [.persistDraftProofreadMode(nextGlobal)] + actions
+    }
+
+    /// 校对底栏点击「上屏纠偏 / 上屏整句」按钮
+    public func commitCurrentDraftProofread() -> [InputAction] {
+        let snap = engine.currentSnapshot()
+        return commitDraftWithProofread(snapshot: snap)
+    }
+
+    /// 校对底栏点击「原文」按钮（忽略 AI / 规则纠偏，原样上屏草稿）
+    public func commitCurrentDraftOriginal() -> [InputAction] {
+        let snap = engine.currentSnapshot()
+        let raw = fullDraftChinese(from: snap)
+        guard !raw.isEmpty else { return resetSession() }
+        return finishCommit(text: raw, requestPredictions: true, recordedPinyin: activeSegmentPinyin(from: snap))
+    }
+
+    /// 手动切换「单字逐选模式 / 回词组模式」（拼写态 ⌥C 或点击顶部「单字」胶囊）
+    public func toggleSingleCharMode() -> [InputAction] {
+        if let sc = singleCharSession {
+            // 退出单字逐选：保留已选前缀，把剩余未选拼音交回主 Rime 会话继续正常打词
+            let picked = sc.selectedText
+            let rest = sc.remainingPinyin
+            singleCharSession = nil
+            engine.clearComposition()
+            rankedItems = []
+            firstPageRescuedTexts.removeAll()
+            highlightedIndex = 0
+
+            if !picked.isEmpty {
+                if effectiveTranslationTarget != nil {
+                    composedChineseBuffer.append(picked)
+                } else if effectiveDraftModeActive {
+                    appendToDraftBuffer(picked)
+                } else if rest.isEmpty {
+                    return finishCommit(text: picked, requestPredictions: true, recordedPinyin: nil)
+                } else {
+                    // 普通模式下已有部分逐字前缀且还有剩余拼音：先把前缀放入临时缓冲，确保不丢字！
+                    // 优先直接上屏已选定前缀，剩余拼音无缝继续由 Rime 拼写
+                    let snap = engine.feedASCII(rest)
+                    return [.commitText(text: picked, requestPredictions: false)] + afterEngineUpdate(snap)
+                }
+            }
+            if !rest.isEmpty {
+                let snap = engine.feedASCII(rest)
+                return afterEngineUpdate(snap)
+            }
+            if effectiveTranslationTarget != nil && !composedChineseBuffer.isEmpty {
+                return refreshComposedTranslationBuffer()
+            }
+            if effectiveDraftModeActive && !draftChineseBuffer.isEmpty {
+                return refreshDraftProofreadBuffer()
+            }
+            return resetSession()
+        }
+
+        let snap = engine.currentSnapshot()
+        guard snap.isComposing else { return [] }
+        let segPinyin = activeSegmentPinyin(from: snap)
+        guard !segPinyin.isEmpty else { return [] }
+
+        let initialPrefix = snap.selectedPrefix
+        engine.clearComposition()
+        rankedItems = []
+        firstPageRescuedTexts.removeAll()
+        highlightedIndex = 0
+        sessionToken &+= 1
+        singleCharSession = SingleCharProgressiveSession(
+            initialPrefix: initialPrefix,
+            rawPinyin: segPinyin,
+            pageSize: preferences.candidatePageSize,
+            isAutoFallback: false,
+            engine: engine,
+            memoryStore: isSecureInput ? nil : memoryStore,
+            allowMemoryPromotion: preferences.enablePersonalMemory && !isSecureInput
+        )
+        if effectiveDraftModeActive {
+            pendingAIDraftSourceText = nil
+            draftProofreadState = .idle
+        }
+        return [.cancelPendingInference, .updateUI(buildSingleCharPanelSnapshot())]
     }
 
     /// 展开 1–6 语种直选胶囊条（双击右 Option 或点击翻译栏 [中→EN ▾] 时调用）
@@ -286,7 +482,7 @@ public final class InputStateMachine {
             chinesePunctuation: nil
         )
         let snap = engine.currentSnapshot()
-        if snap.isComposing || !composedChineseBuffer.isEmpty {
+        if snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty {
             return [persist] + refreshAfterModeChange()
         }
         return [persist, .updateUI(.empty)]
@@ -295,7 +491,7 @@ public final class InputStateMachine {
     /// 候选窗右上角模式胶囊点击：原地切换中文 ↔ 实时翻译
     public func toggleTranslateFromPanelBadge() -> [InputAction] {
         let snap = engine.currentSnapshot()
-        if snap.isComposing || !composedChineseBuffer.isEmpty {
+        if snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty {
             return toggleTranslateDuringComposition(snapshot: snap)
         }
         let willEnable = (mode.translationTarget == nil)
@@ -336,9 +532,13 @@ public final class InputStateMachine {
             mode = .directEnglish
             translationPreview = .hidden
         } else if case .directEnglish = mode {
-            mode = preferences.defaultTranslateMode
-                ? .translateOnCommit(preferredTargetLanguage)
-                : .chinesePinyin
+            if preferences.defaultTranslateMode {
+                mode = .translateOnCommit(preferredTargetLanguage)
+            } else if preferences.defaultDraftProofreadMode {
+                mode = .draftProofread
+            } else {
+                mode = .chinesePinyin
+            }
         }
     }
 
@@ -377,13 +577,66 @@ public final class InputStateMachine {
         return finishCommit(text: source, requestPredictions: true, recordedPinyin: activeSegmentPinyin(from: snap))
     }
 
-    /// 当前是否处于组合态（含翻译模式下的分段中文缓冲、临时英文缓冲与语种快选条）
+    /// 当前是否处于组合态（含翻译分段缓冲、整句暂存校对缓冲、单字逐选、临时英文缓冲与语种快选条）
     public var hasActiveComposition: Bool {
         engine.currentSnapshot().isComposing
             || !composedChineseBuffer.isEmpty
+            || !draftChineseBuffer.isEmpty
+            || singleCharSession != nil
             || !inlinePrefixBuffer.isEmpty
             || inlineEnglishActive
             || isLanguagePickerOpen
+    }
+
+    /// 系统回调 commitComposition(_:) 触发的同步兜底提交：
+    /// 无损冲刷当前草稿缓冲（优先应用已有纠偏）、翻译缓冲、单字逐选、临时英文或未选拼音，并彻底复位状态机，防止丢字与幽灵草稿复活。
+    public func commitActiveCompositionOnSystemRequest() -> [InputAction] {
+        let snap = engine.currentSnapshot()
+        if inlineEnglishActive {
+            let eng = selectedInlineEnglishText()
+            if effectiveDraftModeActive {
+                let raw = draftChineseBuffer + eng
+                let finalText = raw.isEmpty ? "" : resolvedProofreadCommitText(for: raw)
+                guard !finalText.isEmpty else { return resetSession() }
+                return finishCommit(text: finalText, requestPredictions: false, recordedPinyin: nil)
+            }
+            guard !eng.isEmpty else { return resetSession() }
+            return finishCommit(text: eng, requestPredictions: false, recordedPinyin: nil)
+        }
+        if let sc = singleCharSession {
+            let finalized = sc.selectedText.isEmpty ? sc.currentPreviewText : sc.selectedText
+            if effectiveDraftModeActive {
+                let raw = draftChineseBuffer + finalized
+                let finalText = raw.isEmpty ? "" : resolvedProofreadCommitText(for: raw)
+                guard !finalText.isEmpty else { return resetSession() }
+                return finishCommit(text: finalText, requestPredictions: false, recordedPinyin: nil)
+            }
+            let combined = composedChineseBuffer + finalized
+            guard !combined.isEmpty else { return resetSession() }
+            return finishCommit(text: combined, requestPredictions: false, recordedPinyin: nil)
+        }
+        if effectiveDraftModeActive && (snap.isComposing || !draftChineseBuffer.isEmpty) {
+            let raw = fullDraftChinese(from: snap)
+            guard !raw.isEmpty else { return resetSession() }
+            let finalText = resolvedProofreadCommitText(for: raw)
+            return finishCommit(text: finalText, requestPredictions: false, recordedPinyin: nil)
+        }
+        if snap.isComposing || !composedChineseBuffer.isEmpty {
+            let text = fullComposedChinese(from: snap)
+            if !text.isEmpty {
+                return finishCommit(text: text, requestPredictions: false, recordedPinyin: nil)
+            }
+            if let rimeCommitted = engine.commitComposition(), !rimeCommitted.isEmpty {
+                return finishCommit(text: rimeCommitted, requestPredictions: false, recordedPinyin: nil)
+            }
+            return resetSession()
+        }
+        if !inlinePrefixBuffer.isEmpty {
+            let raw = inlinePrefixBuffer
+            inlinePrefixBuffer = ""
+            return finishCommit(text: raw, requestPredictions: false, recordedPinyin: nil)
+        }
+        return resetSession()
     }
 
     /// 切换客户端或失焦时重置组合态并递增令牌，防止陈旧异步回调串窗
@@ -403,6 +656,12 @@ public final class InputStateMachine {
         inlineEnglishBuffer = ""
         inlineEnglishCandidates = []
         composedChineseBuffer = ""
+        draftChineseBuffer = ""
+        draftSegmentLengths = []
+        draftProofreadState = .idle
+        pendingAIDraftSourceText = nil
+        inlineDraftOverride = nil
+        singleCharSession = nil
         rankedItems = []
         firstPageRescuedTexts.removeAll()
         pendingPredictionSnapshot = nil
@@ -419,6 +678,14 @@ public final class InputStateMachine {
         if matchesGlobalDisableTranslateShortcut(event) {
             lastCommitRecord = nil
             return disableGlobalTranslateMode()
+        }
+
+        // 0.5 一键全局开关「整句暂存与校对模式」快捷键（默认 ⌃⌥D，与 ⌃⌥T 对称）
+        if matchesDraftModeToggleShortcut(event) {
+            lastCommitRecord = nil
+            let nextDraft = !preferences.defaultDraftProofreadMode
+            let actions = setDraftProofreadMode(enabled: nextDraft)
+            return [.persistDraftProofreadMode(nextDraft)] + actions
         }
 
         // 1. 系统快捷键（Cmd / Ctrl）一律放行；若当前正展示联想框，先将其收起
@@ -439,6 +706,8 @@ public final class InputStateMachine {
             if event.modifiers == [.option],
                !currentSnap.isComposing,
                composedChineseBuffer.isEmpty,
+               draftChineseBuffer.isEmpty,
+               singleCharSession == nil,
                inlinePrefixBuffer.isEmpty,
                !inlineEnglishActive,
                !predictions.isEmpty,
@@ -474,15 +743,21 @@ public final class InputStateMachine {
             return [.passThrough]
         }
 
+        // 4.5 单字逐选模式激活态（超长输入兜底或手动 ⌥C 进入）
+        if singleCharSession != nil {
+            lastCommitRecord = nil
+            return handleSingleCharKey(event)
+        }
+
         let current = engine.currentSnapshot()
 
-        // 5. 未在拼写且无待译中文缓冲，但存在联想词句时：
+        // 5. 未在拼写且无待译/暂存缓冲，但存在联想词句时：
         //    - 默认模式（digits123）：单手直接按 1/2/3 一键采纳（100% 必达 IMK，绝不被浏览器抢焦点，带数字语境智能避让）
         //    - Tab（无 Shift）：采纳第 1 条（支持 Tab 的应用零学习成本）；彻底废弃易被浏览器抢焦点的 Shift+Tab
         //    - Option+1/2/3：任意模式下均可一键直选（已在步骤 2 优先处理）
         //    - Esc：关闭联想并清除静默接力缓存；其它任意键收起联想条但保留 6 秒静默接力缓存供首字母 0ms 融入候选栏
         var dismissedPredictions = false
-        if !current.isComposing && composedChineseBuffer.isEmpty && inlinePrefixBuffer.isEmpty && !inlineEnglishActive && !predictions.isEmpty {
+        if !current.isComposing && composedChineseBuffer.isEmpty && draftChineseBuffer.isEmpty && inlinePrefixBuffer.isEmpty && !inlineEnglishActive && !predictions.isEmpty {
             switch event.kind {
             case .tab where !event.modifiers.contains(.shift):
                 return acceptPrediction(at: 0)
@@ -522,7 +797,7 @@ public final class InputStateMachine {
             return prependDismissIfNeeded(handleInlineEnglishKey(event))
         }
 
-        // 5.6 Shift + Space 一键开启「临时英文短句模式」（支持空格/数字/符号，回车上屏并自动回中文）
+        // 5.6 Shift + Space 一键开启「临时英文短句模式」（支持空格/数字/符号，回车上屏或追加进草稿后自动回中文）
         if preferences.smartInlineEnglishEnabled,
            event.kind == .space,
            event.modifiers.contains(.shift),
@@ -533,17 +808,18 @@ public final class InputStateMachine {
             return prependDismissIfNeeded(startInlineEnglish(initial: "", allowSpaces: true))
         }
 
-        // 6. 行内语种切换前缀（如 `/ja `、`/en `，以及 `/e ` 临时英文短句）
+        // 6. 行内语种/模式切换前缀（如 `/d `、`/ja `、`/en `，以及 `/e ` 临时英文短句）
         if preferences.inlineLanguagePrefixEnabled,
            !current.isComposing,
            composedChineseBuffer.isEmpty,
+           draftChineseBuffer.isEmpty,
            let prefixActions = handleInlineLanguagePrefix(event) {
             lastCommitRecord = nil
             return prependDismissIfNeeded(prefixActions)
         }
 
-        // 7. 组合态内控制键处理（含翻译模式下已选词待译的 composedChineseBuffer）
-        if current.isComposing || !composedChineseBuffer.isEmpty {
+        // 7. 组合态内控制键处理（含翻译分段缓冲与整句暂存校对缓冲）
+        if current.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty {
             lastCommitRecord = nil
             return handleComposingKey(event, snapshot: current)
         }
@@ -565,6 +841,9 @@ public final class InputStateMachine {
         if inlineEnglishActive {
             guard inlineEnglishCandidates.indices.contains(index) else { return [] }
             return finishInlineEnglishCommit(text: inlineEnglishCandidates[index].text)
+        }
+        if singleCharSession != nil {
+            return pickSingleCharCandidate(at: index)
         }
         let current = engine.currentSnapshot()
         guard current.isComposing else { return [] }
@@ -654,7 +933,7 @@ public final class InputStateMachine {
             let clean = item.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty else { continue }
             let body = clean.hasPrefix("，") ? String(clean.dropFirst()) : clean
-            let keys = pinyinNormalizer.keys(forChineseTerm: body)
+            let keys = pinyinNormalizer.keys(forMixedTerm: body)
             if !keys.fullVariants.isEmpty {
                 entries.append((text: clean, keys: keys))
             }
@@ -704,11 +983,20 @@ public final class InputStateMachine {
         _ scoredCandidates: [ScoredCandidate],
         forToken token: UInt64
     ) -> InputAction? {
-        guard token == sessionToken else { return nil }
+        applyRerankedScoresWithActions(scoredCandidates, forToken: token).first
+    }
+
+    /// 连续分融合 L2 神经重排结果（若草稿模式下首位候选发生变化，自动联动刷新草稿校对避免卡在「校对中」）
+    public func applyRerankedScoresWithActions(
+        _ scoredCandidates: [ScoredCandidate],
+        forToken token: UInt64
+    ) -> [InputAction] {
+        guard token == sessionToken else { return [] }
         let snap = engine.currentSnapshot()
         // 导航冻结锁：用户已手动移动高亮（highlightedIndex > 0）或已翻页（pageNo > 0）时，冻结列表绝不抢光标
-        guard snap.isComposing, snap.pageNo == 0, highlightedIndex == 0, !scoredCandidates.isEmpty else { return nil }
+        guard snap.isComposing, snap.pageNo == 0, highlightedIndex == 0, !scoredCandidates.isEmpty else { return [] }
 
+        let oldTopText = rankedItems.first?.candidate.text ?? snap.candidates.first?.text
         let base: [RankedCandidateItem]
         if !rankedItems.isEmpty {
             base = rankedItems
@@ -729,7 +1017,16 @@ public final class InputStateMachine {
             neuralWeight: learnedNeuralWeight
         )
         highlightedIndex = min(highlightedIndex, max(0, rankedItems.count - 1))
-        return .updateUI(buildPanelSnapshot(from: snap))
+
+        let newTopText = rankedItems.first?.candidate.text
+        if effectiveDraftModeActive && newTopText != oldTopText {
+            let fullDraft = fullDraftChinese(from: snap)
+            return evaluateDraftProofreadAndBuildActions(
+                for: fullDraft,
+                panelSnapshotBuilder: { self.buildPanelSnapshot(from: snap) }
+            )
+        }
+        return [.updateUI(buildPanelSnapshot(from: snap))]
     }
 
     public func applyTranslationPreview(
@@ -745,13 +1042,115 @@ public final class InputStateMachine {
         return .updateUI(buildPanelSnapshot(from: snap))
     }
 
+    /// 合入独立 XPC 返回的 L2 Qwen3-0.6B 整句错字校对结果（支持 L1→L2 串行合流，经五重防幻觉守卫校验）
+    public func applyDraftProofreadResult(
+        _ payload: ProofreadReplyPayload?,
+        forSourceText sourceText: String,
+        forToken token: UInt64
+    ) -> InputAction? {
+        guard token == sessionToken, effectiveDraftModeActive else { return nil }
+        let snap = engine.currentSnapshot()
+        guard snap.isComposing || !draftChineseBuffer.isEmpty || singleCharSession != nil else { return nil }
+        let currentRawSource = fullDraftChinese(from: snap)
+        let ruleBaseline = proofreadEngine.applyRuleProofread(to: currentRawSource)
+        let matchesRaw = (sourceText == currentRawSource)
+        let matchesRuleChained = (ruleBaseline.hasChanges && sourceText == ruleBaseline.correctedText)
+        guard matchesRaw || matchesRuleChained else { return nil }
+        pendingAIDraftSourceText = nil
+
+        if let payload, !payload.correctedText.isEmpty {
+            let label = payload.fromCache ? "缓存" : "AI"
+            if let validated = proofreadEngine.validateAndBuildState(
+                source: sourceText,
+                candidateOutput: payload.correctedText,
+                latencyMs: payload.latencyMs,
+                backendLabel: label
+            ) {
+                switch validated {
+                case .suggested(_, let finalCorrected, _, _, let latencyMs, let validatedLabel):
+                    let combinedDiff = DraftProofreadEngine.buildDiff(
+                        source: currentRawSource,
+                        corrected: finalCorrected
+                    )
+                    if combinedDiff.changeCount > 0 && finalCorrected != currentRawSource {
+                        let mergedLabel = ruleBaseline.hasChanges ? "规则+\(validatedLabel)" : validatedLabel
+                        draftProofreadState = .suggested(
+                            sourceText: currentRawSource,
+                            correctedText: finalCorrected,
+                            segments: combinedDiff.segments,
+                            changeCount: combinedDiff.changeCount,
+                            latencyMs: latencyMs,
+                            backendLabel: mergedLabel
+                        )
+                    } else {
+                        draftProofreadState = .clean(
+                            sourceText: currentRawSource,
+                            latencyMs: latencyMs,
+                            backendLabel: validatedLabel
+                        )
+                    }
+                case .clean(_, let latencyMs, let validatedLabel):
+                    if ruleBaseline.hasChanges {
+                        draftProofreadState = .suggested(
+                            sourceText: currentRawSource,
+                            correctedText: ruleBaseline.correctedText,
+                            segments: ruleBaseline.segments,
+                            changeCount: ruleBaseline.changeCount,
+                            latencyMs: 0.2,
+                            backendLabel: "规则"
+                        )
+                    } else {
+                        draftProofreadState = .clean(
+                            sourceText: currentRawSource,
+                            latencyMs: latencyMs,
+                            backendLabel: validatedLabel
+                        )
+                    }
+                default:
+                    break
+                }
+                if singleCharSession != nil {
+                    return .updateUI(buildSingleCharPanelSnapshot())
+                }
+                return .updateUI(buildPanelSnapshot(from: snap))
+            }
+        }
+
+        // 模型不可用/超时或被防幻觉守卫拦截时：
+        // 若当前已持有针对同一草稿的有效纠偏建议（例如补句末标点时继承的 AI 纠偏），保留它绝不倒退为「无误」
+        if case .suggested(let existingSource, _, _, _, _, _) = draftProofreadState,
+           existingSource == currentRawSource {
+            // 保持已有有效纠偏状态不变
+        } else if ruleBaseline.hasChanges {
+            draftProofreadState = .suggested(
+                sourceText: currentRawSource,
+                correctedText: ruleBaseline.correctedText,
+                segments: ruleBaseline.segments,
+                changeCount: ruleBaseline.changeCount,
+                latencyMs: 0.2,
+                backendLabel: "规则"
+            )
+        } else {
+            draftProofreadState = .clean(sourceText: currentRawSource, latencyMs: 0.2, backendLabel: "规则")
+        }
+        if singleCharSession != nil {
+            return .updateUI(buildSingleCharPanelSnapshot())
+        }
+        return .updateUI(buildPanelSnapshot(from: snap))
+    }
+
     public func applyPredictions(
         _ items: [String],
         modelLabel: String? = nil,
         forToken token: UInt64
     ) -> InputAction? {
         guard token == sessionToken else { return nil }
-        guard !engine.currentSnapshot().isComposing, composedChineseBuffer.isEmpty, !items.isEmpty else { return nil }
+        guard !engine.currentSnapshot().isComposing,
+              composedChineseBuffer.isEmpty,
+              draftChineseBuffer.isEmpty,
+              singleCharSession == nil,
+              !items.isEmpty
+        else { return nil }
         cachePredictionsForInlineFusion(items, forLeftContext: currentLeftContext)
         guard preferences.predictionDisplayStyle == .barAndInlineFusion else { return nil }
         predictions = items
@@ -1041,6 +1440,22 @@ public final class InputStateMachine {
         }
     }
 
+    private func matchesDraftModeToggleShortcut(_ event: NormalizedKeyEvent) -> Bool {
+        let shortcut = preferences.draftModeToggleShortcut
+        guard shortcut != .off else { return false }
+        guard case .character(let ch, let keyCode) = event.kind,
+              (keyCode == 2 || ch.lowercased() == "d")
+        else { return false }
+        switch shortcut {
+        case .controlOptionD:
+            return event.modifiers == [.control, .option]
+        case .optionShiftD:
+            return event.modifiers == [.option, .shift]
+        case .off:
+            return false
+        }
+    }
+
     /// 强制全局关闭翻译模式（绝不误开，保留正在拼写的拼音，跨窗口广播同步）
     public func disableGlobalTranslateMode() -> [InputAction] {
         preferences.defaultTranslateMode = false
@@ -1051,7 +1466,7 @@ public final class InputStateMachine {
         isLanguagePickerOpen = false
         translationPreview = .hidden
         if case .translateOnCommit = mode {
-            mode = .chinesePinyin
+            mode = preferences.defaultDraftProofreadMode ? .draftProofread : .chinesePinyin
         }
 
         let persist = InputAction.persistPreferencesChange(
@@ -1061,6 +1476,11 @@ public final class InputStateMachine {
             chinesePunctuation: nil
         )
         let snap = engine.currentSnapshot()
+        if mode.isDraftProofread && !composedChineseBuffer.isEmpty {
+            appendToDraftBuffer(composedChineseBuffer)
+            composedChineseBuffer = ""
+            return [.cancelPendingInference, persist] + refreshDraftProofreadBuffer()
+        }
         if snap.isComposing {
             return [.cancelPendingInference, persist, .updateUI(buildPanelSnapshot(from: snap))]
         }
@@ -1105,16 +1525,38 @@ public final class InputStateMachine {
                 chinesePunctuation: nil
             )] + actions
 
+        case .character(let ch, let keyCode) where (keyCode == 8 || ch.lowercased() == "c") && event.modifiers == [.option]:
+            // 拼写态 Option+C：一键进入 / 退出「单字逐选模式」（空态完全放行给宿主 App，零热键冲突）
+            if singleCharSession != nil || engine.currentSnapshot().isComposing {
+                return toggleSingleCharMode()
+            }
+            return [.passThrough]
+
+        case .backspace where event.modifiers == [.option]:
+            // 整句暂存校对模式下 Option+Backspace：一次撤回最近一个已选词段
+            let snap = engine.currentSnapshot()
+            if singleCharSession == nil, !snap.isComposing, !draftChineseBuffer.isEmpty {
+                popLastDraftSegment()
+                if draftChineseBuffer.isEmpty {
+                    return resetSession()
+                }
+                return refreshDraftProofreadBuffer()
+            }
+            return [.passThrough]
+
         case .tab:
             // 拼写态按 Option+Tab：确定性一键切换全局持续翻译开关（空态完全放行给宿主 App）
             let snap = engine.currentSnapshot()
-            guard snap.isComposing || !composedChineseBuffer.isEmpty else { return [.passThrough] }
+            guard snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty else { return [.passThrough] }
             let isCurrentlyGlobal = (mode.translationTarget != nil && !suppressTranslateForCurrentSentence)
             return setPersistentTranslateInComposition(enabled: !isCurrentlyGlobal, snapshot: snap)
 
         case .returnKey:
-            // Option+Return：在译文模式下强制上屏中文原文
+            // Option+Return：译文模式或整句校对模式下均强制上屏未改动的中文原文
             let snap = engine.currentSnapshot()
+            if effectiveDraftModeActive && (snap.isComposing || !draftChineseBuffer.isEmpty || singleCharSession != nil) {
+                return commitCurrentDraftOriginal()
+            }
             guard snap.isComposing || !composedChineseBuffer.isEmpty else { return [.passThrough] }
             let chinese = fullComposedChinese(from: snap)
             return finishCommit(text: chinese, requestPredictions: true, recordedPinyin: activeSegmentPinyin(from: snap))
@@ -1129,20 +1571,42 @@ public final class InputStateMachine {
         var actions: [InputAction] = []
         if inlineEnglishActive {
             let pending = inlineEnglishBuffer
+            let hadDraft = !draftChineseBuffer.isEmpty
+            let resolvedDraft = hadDraft ? resolvedProofreadCommitText(for: draftChineseBuffer) : ""
             inlineEnglishActive = false
             inlineEnglishAllowsSpaces = false
             inlineEnglishBuffer = ""
             inlineEnglishCandidates = []
+            draftChineseBuffer = ""
+            draftSegmentLengths = []
+            draftProofreadState = .idle
+            pendingAIDraftSourceText = nil
+            inlineDraftOverride = nil
             highlightedIndex = 0
             sessionToken &+= 1
-            actions.append(.updateUI(.empty))
-            if !pending.isEmpty {
-                actions.append(.commitText(text: pending, requestPredictions: false))
+            if hadDraft {
+                actions.append(.cancelPendingInference)
             }
-        } else if snap.isComposing || !composedChineseBuffer.isEmpty {
-            let raw = composedChineseBuffer + (snap.rawInput.isEmpty ? snap.preedit : snap.rawInput)
+            actions.append(.updateUI(.empty))
+            let combined = resolvedDraft + pending
+            if !combined.isEmpty {
+                actions.append(.commitText(text: combined, requestPredictions: false))
+            }
+        } else if snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty || singleCharSession != nil {
+            let scRaw = singleCharSession.map { $0.selectedText + $0.remainingPinyin } ?? ""
+            let rimeRaw = snap.rawInput.isEmpty ? snap.preedit : snap.rawInput
+            let resolvedDraft = !draftChineseBuffer.isEmpty
+                ? resolvedProofreadCommitText(for: draftChineseBuffer)
+                : ""
+            let raw = composedChineseBuffer + resolvedDraft + scRaw + rimeRaw
             engine.clearComposition()
             composedChineseBuffer = ""
+            draftChineseBuffer = ""
+            draftSegmentLengths = []
+            draftProofreadState = .idle
+            pendingAIDraftSourceText = nil
+            inlineDraftOverride = nil
+            singleCharSession = nil
             rankedItems = []
             highlightedIndex = 0
             translationPreview = .hidden
@@ -1155,9 +1619,13 @@ public final class InputStateMachine {
             }
         }
         if case .directEnglish = mode {
-            mode = preferences.defaultTranslateMode
-                ? .translateOnCommit(preferredTargetLanguage)
-                : .chinesePinyin
+            if preferences.defaultTranslateMode {
+                mode = .translateOnCommit(preferredTargetLanguage)
+            } else if preferences.defaultDraftProofreadMode {
+                mode = .draftProofread
+            } else {
+                mode = .chinesePinyin
+            }
         } else {
             mode = .directEnglish
         }
@@ -1171,7 +1639,7 @@ public final class InputStateMachine {
                 return [.updateUI(CandidatePanelSnapshot(
                     isVisible: true,
                     mode: mode,
-                    preedit: "/  (t 译文 · en/ja/ko/fr/de/es 语种 · e 英文 · code 标点)",
+                    preedit: "/  (d 校对暂存 · t 译文 · en/ja/ko 语种 · e 英文 · code 标点)",
                     isCodingModeActive: isEffectiveCodingMode,
                     activeModelLabel: "输入指令后按空格"
                 ))]
@@ -1200,6 +1668,11 @@ public final class InputStateMachine {
             if preferences.smartInlineEnglishEnabled && code == "e" {
                 return startInlineEnglish(initial: "", allowSpaces: true)
             }
+            if code == "d" || code == "j" {
+                let willEnable = !preferences.defaultDraftProofreadMode
+                let actions = setDraftProofreadMode(enabled: willEnable)
+                return [.persistDraftProofreadMode(willEnable)] + actions
+            }
             if code == "t" {
                 let willEnable = (mode.translationTarget == nil)
                 preferences.defaultTranslateMode = willEnable
@@ -1208,7 +1681,7 @@ public final class InputStateMachine {
                 if willEnable {
                     mode = .translateOnCommit(preferredTargetLanguage)
                 } else {
-                    mode = .chinesePinyin
+                    mode = preferences.defaultDraftProofreadMode ? .draftProofread : .chinesePinyin
                     translationPreview = .hidden
                 }
                 return [
@@ -1315,6 +1788,14 @@ public final class InputStateMachine {
 
         switch event.kind {
         case .escape:
+            // 整句暂存校对模式下：若当前有未选完的拼音且已有草稿，首次 Esc 仅清当前拼音以保护已拼好的整句草稿！
+            if snapshot.isComposing && !draftChineseBuffer.isEmpty {
+                engine.clearComposition()
+                rankedItems = []
+                firstPageRescuedTexts.removeAll()
+                highlightedIndex = 0
+                return refreshDraftProofreadBuffer()
+            }
             return resetSession()
 
         case .tab:
@@ -1349,6 +1830,26 @@ public final class InputStateMachine {
                 }
                 let cached = readyCachedTranslation(for: source, target: target)
                 return finishTranslationCommit(sourceText: source, target: target, cached: cached)
+            }
+            // 整句暂存与校对模式：
+            // - Shift+Return 始终强制上屏未改动的中文原稿；
+            // - 默认两段空格（.stageThenCommit）且草稿区为空、尚未选定前缀汉字时，按 Return 遵循 returnKeyBehavior（默认直出原始英文，与普通中文模式一致）；
+            // - 其余情况（已有暂存草稿 / 传统空格补空格模式 / 回车提交首选）均执行整句纠偏上屏。
+            if effectiveDraftModeActive {
+                let rawDraft = fullDraftChinese(from: snapshot)
+                guard !rawDraft.isEmpty else { return resetSession() }
+                if event.modifiers.contains(.shift) {
+                    return finishCommit(text: rawDraft, requestPredictions: true, recordedPinyin: activeSegmentPinyin(from: snapshot))
+                }
+                if preferences.draftSpaceBehavior == .stageThenCommit,
+                   draftChineseBuffer.isEmpty,
+                   snapshot.isComposing,
+                   snapshot.selectedPrefix.isEmpty,
+                   preferences.returnKeyBehavior == .commitRawInput {
+                    let raw = snapshot.rawInput.isEmpty ? snapshot.preedit : snapshot.rawInput
+                    return finishCommit(text: raw, requestPredictions: false, recordedPinyin: nil)
+                }
+                return commitDraftWithProofread(snapshot: snapshot)
             }
             // 普通中文模式：Shift+Return 一键译文上屏
             if preferences.shiftReturnQuickTranslate && event.modifiers.contains(.shift) {
@@ -1392,6 +1893,21 @@ public final class InputStateMachine {
                 let cached = readyCachedTranslation(for: source, target: target)
                 return finishTranslationCommit(sourceText: source, target: target, cached: cached)
             }
+            if effectiveDraftModeActive {
+                // 1. 拼写态按空格：选词进入底部草稿区校对（若草稿为空且选中的是纯英文候选，则在 commitSelectedOrAdvance 内直接上屏）
+                if snapshot.isComposing {
+                    return commitSelectedOrAdvance(index: highlightedIndex, snapshot: snapshot)
+                }
+                // 2. 草稿待确认态按空格：默认（.stageThenCommit）确认无误直接上屏整句 / 纠偏整句；传统模式追加空格
+                if !draftChineseBuffer.isEmpty {
+                    if preferences.draftSpaceBehavior == .composeChineseSegment {
+                        appendToDraftBuffer(" ")
+                        return refreshDraftProofreadBuffer()
+                    }
+                    return commitDraftWithProofread(snapshot: snapshot)
+                }
+                return [.passThrough]
+            }
             return commitSelectedOrAdvance(index: highlightedIndex, snapshot: snapshot)
 
         case .character(let ch, _) where ch.count == 1 && ch >= "1" && ch <= "9":
@@ -1399,19 +1915,53 @@ public final class InputStateMachine {
                 let idx = Int(ch)! - 1
                 return commitSelectedOrAdvance(index: idx, snapshot: snapshot)
             }
-            // 若翻译模式下已选完中文等待上屏，输入数字直接拼入待译中文句
+            // 若翻译模式或整句暂存模式下已选完中文等待上屏，输入数字直接拼入当前缓冲
             if effectiveTarget != nil, !composedChineseBuffer.isEmpty {
                 composedChineseBuffer.append(ch)
                 return refreshComposedTranslationBuffer()
             }
+            if effectiveDraftModeActive, !draftChineseBuffer.isEmpty {
+                appendToDraftBuffer(ch)
+                return refreshDraftProofreadBuffer()
+            }
             return [.passThrough]
 
-        case .character("-", _), .pageUp:
+        case .character("-", _):
+            if snapshot.isComposing {
+                let nextSnap = engine.changePage(forward: false)
+                return afterEngineUpdate(nextSnap)
+            }
+            if effectiveTarget != nil, !composedChineseBuffer.isEmpty {
+                composedChineseBuffer.append("-")
+                return refreshComposedTranslationBuffer()
+            }
+            if effectiveDraftModeActive, !draftChineseBuffer.isEmpty {
+                appendToDraftBuffer("-")
+                return refreshDraftProofreadBuffer()
+            }
+            return [.passThrough]
+
+        case .pageUp:
             guard snapshot.isComposing else { return [.passThrough] }
             let nextSnap = engine.changePage(forward: false)
             return afterEngineUpdate(nextSnap)
 
-        case .character("=", _), .pageDown:
+        case .character("=", _):
+            if snapshot.isComposing {
+                let nextSnap = engine.changePage(forward: true)
+                return afterEngineUpdate(nextSnap)
+            }
+            if effectiveTarget != nil, !composedChineseBuffer.isEmpty {
+                composedChineseBuffer.append("=")
+                return refreshComposedTranslationBuffer()
+            }
+            if effectiveDraftModeActive, !draftChineseBuffer.isEmpty {
+                appendToDraftBuffer("=")
+                return refreshDraftProofreadBuffer()
+            }
+            return [.passThrough]
+
+        case .pageDown:
             guard snapshot.isComposing else { return [.passThrough] }
             let nextSnap = engine.changePage(forward: true)
             return afterEngineUpdate(nextSnap)
@@ -1432,6 +1982,11 @@ public final class InputStateMachine {
                     highlightedIndex = 0
                     return refreshComposedTranslationBuffer()
                 }
+                if !nextSnap.isComposing && !draftChineseBuffer.isEmpty {
+                    rankedItems = []
+                    highlightedIndex = 0
+                    return refreshDraftProofreadBuffer()
+                }
                 return afterEngineUpdate(nextSnap)
             }
             if !composedChineseBuffer.isEmpty {
@@ -1441,23 +1996,33 @@ public final class InputStateMachine {
                 }
                 return refreshComposedTranslationBuffer()
             }
+            if !draftChineseBuffer.isEmpty {
+                removeLastDraftCharacter()
+                if draftChineseBuffer.isEmpty {
+                    return resetSession()
+                }
+                return refreshDraftProofreadBuffer()
+            }
             return [.passThrough]
 
         case .character(let ch, _):
             guard let scalar = ch.unicodeScalars.first else { return [.passThrough] }
             if snapshot.isComposing {
-                // 驼峰命名（如 useState / macOS / iOS）或下划线标识符（如 user_id / max_tokens）自动无感转入临时英文
+                // 驼峰命名（如 useState / macOS / iOS）、下划线标识符（如 user_id / max_tokens）与 URL 协议前缀（如 https: / localhost:）自动无感转入临时英文
                 if preferences.smartInlineEnglishEnabled,
                    snapshot.selectedPrefix.isEmpty,
                    composedChineseBuffer.isEmpty,
-                   ch.count == 1,
-                   ((scalar.value >= 65 && scalar.value <= 90) || scalar.value == 95) {
+                   ch.count == 1 {
                     let raw = snapshot.rawInput.isEmpty ? snapshot.preedit : snapshot.rawInput
-                    engine.clearComposition()
-                    rankedItems = []
-                    highlightedIndex = 0
-                    translationPreview = .hidden
-                    return [.cancelPendingInference] + startInlineEnglish(initial: raw + ch, allowSpaces: false)
+                    let isCamelOrSnake = ((scalar.value >= 65 && scalar.value <= 90) || scalar.value == 95)
+                    let isURLSchemeColon = (ch == ":" && Self.urlSchemePrefixes.contains(raw.lowercased()))
+                    if isCamelOrSnake || isURLSchemeColon {
+                        engine.clearComposition()
+                        rankedItems = []
+                        highlightedIndex = 0
+                        translationPreview = .hidden
+                        return [.cancelPendingInference] + startInlineEnglish(initial: raw + ch, allowSpaces: false)
+                    }
                 }
                 // 标点符号结束当前拼写段：交由 SmartPunctuationEngine 统一产出与空态 100% 一致的中文/英文标点
                 if SmartPunctuationEngine.isMappedPunctuationKey(ch) {
@@ -1480,6 +2045,27 @@ public final class InputStateMachine {
                         composedChineseBuffer = chinese + punct
                         return refreshComposedTranslationBuffer()
                     }
+                    if effectiveDraftModeActive {
+                        let segment = currentSegmentSentence(from: snapshot)
+                        recordImplicitAcceptanceIfTopCandidate(snapshot: snapshot)
+                        engine.clearComposition()
+                        rankedItems = []
+                        highlightedIndex = 0
+                        let punct = punctuationEngine.mapPunctuation(
+                            ch,
+                            context: .init(
+                                mode: mode,
+                                preferences: preferences,
+                                appBundleID: activeAppBundleID,
+                                leftContext: currentLeftContext + draftChineseBuffer + segment
+                            )
+                        ) ?? ch
+                        if !segment.isEmpty {
+                            appendToDraftBuffer(segment)
+                        }
+                        appendToDraftBuffer(punct)
+                        return refreshDraftProofreadBuffer()
+                    }
                     recordImplicitAcceptanceIfTopCandidate(snapshot: snapshot)
                     let punct = punctuationEngine.mapPunctuation(
                         ch,
@@ -1499,14 +2085,22 @@ public final class InputStateMachine {
                 let (_, nextSnap) = engine.processKey(keyval: Int32(scalar.value), mask: 0)
                 return afterEngineUpdate(nextSnap)
             }
-            // 翻译模式下已有 composedChineseBuffer，继续敲字母开启下一段中文拼写
+            // 翻译或整句暂存模式下已有前置缓冲，继续敲小写字母开启下一段中文拼写
             if scalar.value >= 97 && scalar.value <= 122 {
                 let (handled, nextSnap) = engine.processKey(keyval: Int32(scalar.value), mask: 0)
                 if handled {
                     return afterEngineUpdate(nextSnap)
                 }
             }
-            // 标点等直接追加到待译中文句中并刷新译文
+            // 整句暂存模式下敲大写字母：无缝进入临时英文快车道，确认后自动追加进整句草稿区（如「我用 React 写接口」）
+            if effectiveDraftModeActive,
+               preferences.smartInlineEnglishEnabled,
+               !draftChineseBuffer.isEmpty,
+               ch.count == 1,
+               scalar.value >= 65 && scalar.value <= 90 {
+                return startInlineEnglish(initial: ch, allowSpaces: false)
+            }
+            // 标点等直接追加到待译中文句或整句草稿中
             if effectiveTarget != nil, !composedChineseBuffer.isEmpty {
                 let mapped = punctuationEngine.mapPunctuation(
                     ch,
@@ -1520,6 +2114,19 @@ public final class InputStateMachine {
                 ) ?? ch
                 composedChineseBuffer.append(mapped)
                 return refreshComposedTranslationBuffer()
+            }
+            if effectiveDraftModeActive, !draftChineseBuffer.isEmpty {
+                let mapped = punctuationEngine.mapPunctuation(
+                    ch,
+                    context: .init(
+                        mode: mode,
+                        preferences: preferences,
+                        appBundleID: activeAppBundleID,
+                        leftContext: currentLeftContext + draftChineseBuffer
+                    )
+                ) ?? ch
+                appendToDraftBuffer(mapped)
+                return refreshDraftProofreadBuffer()
             }
             return [.passThrough]
 
@@ -1593,10 +2200,26 @@ public final class InputStateMachine {
                 suppressTranslateForCurrentSentence = true
             }
             translationPreview = .hidden
+            if effectiveDraftModeActive {
+                if !composedChineseBuffer.isEmpty {
+                    appendToDraftBuffer(composedChineseBuffer)
+                    composedChineseBuffer = ""
+                }
+                if !draftChineseBuffer.isEmpty || snapshot.isComposing {
+                    return [.cancelPendingInference] + refreshDraftProofreadBuffer()
+                }
+            }
             return [.cancelPendingInference, .updateUI(buildPanelSnapshot(from: snapshot))]
         } else {
             suppressTranslateForCurrentSentence = false
             inlineOverrideTarget = preferredTargetLanguage
+            if !draftChineseBuffer.isEmpty {
+                composedChineseBuffer.append(draftChineseBuffer)
+                draftChineseBuffer = ""
+                draftSegmentLengths = []
+                draftProofreadState = .idle
+                pendingAIDraftSourceText = nil
+            }
             return refreshAfterModeChange()
         }
     }
@@ -1619,11 +2242,23 @@ public final class InputStateMachine {
             chinesePunctuation: nil
         )
         if enabled {
+            if !draftChineseBuffer.isEmpty {
+                composedChineseBuffer.append(draftChineseBuffer)
+                draftChineseBuffer = ""
+                draftSegmentLengths = []
+                draftProofreadState = .idle
+                pendingAIDraftSourceText = nil
+            }
             mode = .translateOnCommit(activeTarget)
             return [persist] + refreshAfterModeChange()
         } else {
-            mode = .chinesePinyin
+            mode = preferences.defaultDraftProofreadMode ? .draftProofread : .chinesePinyin
             translationPreview = .hidden
+            if mode.isDraftProofread && !composedChineseBuffer.isEmpty {
+                appendToDraftBuffer(composedChineseBuffer)
+                composedChineseBuffer = ""
+                return [.cancelPendingInference, persist] + refreshDraftProofreadBuffer()
+            }
             if snapshot.isComposing {
                 return [.cancelPendingInference, persist, .updateUI(buildPanelSnapshot(from: snapshot))]
             }
@@ -1667,7 +2302,7 @@ public final class InputStateMachine {
 
     private func buildPanelWithLanguagePicker() -> CandidatePanelSnapshot {
         let snap = engine.currentSnapshot()
-        if snap.isComposing || !composedChineseBuffer.isEmpty {
+        if snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty {
             return buildPanelSnapshot(from: snap)
         }
         return CandidatePanelSnapshot(
@@ -1684,7 +2319,7 @@ public final class InputStateMachine {
 
     private func refreshUIOnlyAfterPickerClose() -> InputAction {
         let snap = engine.currentSnapshot()
-        if snap.isComposing || !composedChineseBuffer.isEmpty {
+        if snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty {
             return .updateUI(buildPanelSnapshot(from: snap))
         }
         return .updateUI(.empty)
@@ -1818,6 +2453,9 @@ public final class InputStateMachine {
         inlineEnglishBuffer = ""
         inlineEnglishCandidates = []
         highlightedIndex = 0
+        if effectiveDraftModeActive && !draftChineseBuffer.isEmpty {
+            return refreshDraftProofreadBuffer()
+        }
         return [.updateUI(.empty)]
     }
 
@@ -1829,7 +2467,19 @@ public final class InputStateMachine {
         inlineEnglishCandidates = []
         highlightedIndex = 0
         lastCommitRecord = nil
-        guard !text.isEmpty else { return [.updateUI(.empty)] }
+        guard !text.isEmpty else {
+            if effectiveDraftModeActive && !draftChineseBuffer.isEmpty {
+                return refreshDraftProofreadBuffer()
+            }
+            return [.updateUI(.empty)]
+        }
+        // 仅当草稿区已有前置中文（中英混输同一草稿句）时才追加进草稿区；
+        // 草稿区为空时的独立英文词/短句（React / useState / user_id / Shift+空格）直接上屏，绝不被困入中文校对卡片！
+        if effectiveDraftModeActive && !draftChineseBuffer.isEmpty {
+            appendToDraftBuffer(text)
+            return refreshDraftProofreadBuffer()
+        }
+        _ = recordCommittedToMemory(text: text, recordedPinyin: nil, leftContext: currentLeftContext)
         return [
             .updateUI(.empty),
             .commitText(text: text, requestPredictions: false)
@@ -1839,6 +2489,12 @@ public final class InputStateMachine {
     private func finishInlineEnglishAndPassThrough() -> [InputAction] {
         let pending = inlineEnglishBuffer
         _ = exitInlineEnglish()
+        if effectiveDraftModeActive && !draftChineseBuffer.isEmpty {
+            if !pending.isEmpty {
+                appendToDraftBuffer(pending)
+            }
+            return refreshDraftProofreadBuffer() + [.passThrough]
+        }
         if pending.isEmpty {
             return [.updateUI(.empty), .passThrough]
         }
@@ -1853,26 +2509,72 @@ public final class InputStateMachine {
         var cands: [PinyinCandidate] = []
         if !inlineEnglishBuffer.isEmpty {
             cands.append(PinyinCandidate(index: 0, text: inlineEnglishBuffer, source: .rime))
-            if !inlineEnglishAllowsSpaces,
-               preferences.enableDocumentEnglishTokens,
-               !isSecureInput {
+            if !inlineEnglishAllowsSpaces, !isSecureInput {
                 var added = Set<String>([inlineEnglishBuffer])
-                if preferences.enableDocumentContextAssist, let docIndex = documentIndex {
-                    for text in docIndex.matchEnglishCompletions(prefix: inlineEnglishBuffer, maxResults: 4)
-                    where added.insert(text).inserted {
-                        cands.append(PinyinCandidate(index: cands.count, text: text, source: .documentContext))
+                var addedLower = Set<String>([inlineEnglishBuffer.lowercased()])
+                if preferences.enableDocumentEnglishTokens {
+                    if preferences.enableDocumentContextAssist, let docIndex = documentIndex {
+                        for text in docIndex.matchEnglishCompletions(prefix: inlineEnglishBuffer, maxResults: 4)
+                        where added.insert(text).inserted {
+                            addedLower.insert(text.lowercased())
+                            cands.append(PinyinCandidate(index: cands.count, text: text, source: .documentContext))
+                        }
+                    }
+                    if preferences.enableWorkingMemory, let wm = workingMemory, cands.count < 5 {
+                        let remain = 5 - cands.count
+                        for text in wm.matchEnglishCompletions(
+                            prefix: inlineEnglishBuffer,
+                            appBundleID: activeAppBundleID,
+                            shareAcrossApps: preferences.shareWorkingMemoryAcrossApps,
+                            maxResults: remain,
+                            now: clock()
+                        ) where added.insert(text).inserted {
+                            addedLower.insert(text.lowercased())
+                            cands.append(PinyinCandidate(index: cands.count, text: text, source: .workingMemory))
+                        }
                     }
                 }
-                if preferences.enableWorkingMemory, let wm = workingMemory, cands.count < 5 {
-                    let remain = 5 - cands.count
-                    for text in wm.matchEnglishCompletions(
-                        prefix: inlineEnglishBuffer,
-                        appBundleID: activeAppBundleID,
-                        shareAcrossApps: preferences.shareWorkingMemoryAcrossApps,
-                        maxResults: remain,
-                        now: clock()
-                    ) where added.insert(text).inserted {
-                        cands.append(PinyinCandidate(index: cands.count, text: text, source: .workingMemory))
+                let isPureASCIIAlpha = inlineEnglishBuffer.unicodeScalars.allSatisfy {
+                    ($0.value >= 65 && $0.value <= 90) || ($0.value >= 97 && $0.value <= 122)
+                }
+                if preferences.enableMixedBilingualAssist && isPureASCIIAlpha {
+                    // 离线 73K 英文词典前缀补全（空白文档下敲 Dock / Reac / Swif 也能一键 Tab 补全）
+                    if cands.count < 5 && inlineEnglishBuffer.count >= 2 {
+                        let completions = englishLexicon.prefixCompletions(
+                            for: inlineEnglishBuffer,
+                            limit: 6,
+                            preferCapitalized: true
+                        )
+                        for entry in completions where cands.count < 5 {
+                            if entry.lower == inlineEnglishBuffer.lowercased() {
+                                // 若规范大小写与原输入不同（如 Vscode -> VSCode），作为次选提供；否则跳过避免重复
+                                guard entry.isCuratedTech && entry.display != inlineEnglishBuffer && added.insert(entry.display).inserted else {
+                                    continue
+                                }
+                                cands.append(PinyinCandidate(index: cands.count, text: entry.display, source: .mixedBilingual))
+                                continue
+                            }
+                            if addedLower.insert(entry.lower).inserted && added.insert(entry.display).inserted {
+                                cands.append(PinyinCandidate(index: cands.count, text: entry.display, source: .mixedBilingual))
+                            }
+                        }
+                    }
+                    // 临时英文拼写纠错：仅在无前缀补全命中且非合法词典词时，于第 2~3 位给出带「纠」微标的纠错候选，
+                    // 保留第 1 位原词（按 Space 原样保留自定义变量名，按 Tab 一键采纳纠正！）
+                    if preferences.enableAutoCorrection,
+                       cands.count <= 1,
+                       inlineEnglishBuffer.count >= 3,
+                       englishLexicon.lookupExact(inlineEnglishBuffer) == nil {
+                        let corrections = englishLexicon.fuzzyCorrect(
+                            query: inlineEnglishBuffer,
+                            curatedOnly: false,
+                            limit: 2
+                        )
+                        for corr in corrections where cands.count < 4 {
+                            if addedLower.insert(corr.lower).inserted && added.insert(corr.text).inserted {
+                                cands.append(PinyinCandidate(index: cands.count, text: corr.text, source: .typoCorrected))
+                            }
+                        }
                     }
                 }
             }
@@ -1880,13 +2582,28 @@ public final class InputStateMachine {
         inlineEnglishCandidates = cands
         highlightedIndex = min(highlightedIndex, max(0, cands.count - 1))
 
+        let inDraft = effectiveDraftModeActive && !draftChineseBuffer.isEmpty
         let displayPreedit: String
         if inlineEnglishBuffer.isEmpty {
-            displayPreedit = "临时英文（支持空格 · ⏎ 上屏回中文 · Esc 取消）"
+            displayPreedit = inDraft
+                ? "\(draftChineseBuffer) 临时英文（支持空格 · ⏎ 追加至草稿 · Esc 取消）"
+                : "临时英文（支持空格 · ⏎ 上屏回中文 · Esc 取消）"
         } else if inlineEnglishAllowsSpaces {
-            displayPreedit = "\(inlineEnglishBuffer)  [⏎ 上屏回中文]"
+            let hint = inDraft ? "[⏎ 追加至草稿]" : "[⏎ 上屏回中文]"
+            displayPreedit = inDraft
+                ? "\(draftChineseBuffer) \(inlineEnglishBuffer)  \(hint)"
+                : "\(inlineEnglishBuffer)  \(hint)"
         } else {
-            displayPreedit = inlineEnglishBuffer
+            displayPreedit = inDraft
+                ? "\(draftChineseBuffer) \(inlineEnglishBuffer)"
+                : inlineEnglishBuffer
+        }
+
+        let actionHint: String
+        if inDraft {
+            actionHint = inlineEnglishAllowsSpaces ? "临时英文短句 · ⏎ 追加至草稿" : "临时英文 · ␣/⏎ 追加至草稿"
+        } else {
+            actionHint = inlineEnglishAllowsSpaces ? "临时英文短句 · ⏎ 上屏" : "临时英文 · ␣/⏎ 上屏"
         }
 
         return CandidatePanelSnapshot(
@@ -1896,9 +2613,20 @@ public final class InputStateMachine {
             candidates: cands,
             highlightedIndex: highlightedIndex,
             showTranslationBar: false,
-            activeModelLabel: inlineEnglishAllowsSpaces ? "临时英文短句 · ⏎ 上屏" : "临时英文 · ␣/⏎ 上屏"
+            showDraftBar: inDraft,
+            draftSourcePreview: inDraft ? (draftChineseBuffer + inlineEnglishBuffer) : "",
+            draftCommittedLength: inDraft ? draftChineseBuffer.count : 0,
+            draftProofreadState: inDraft ? draftProofreadState : .idle,
+            draftSpaceCommitsDraft: preferences.draftSpaceBehavior == .stageThenCommit,
+            isGlobalDraftMode: inDraft && mode.isDraftProofread && inlineDraftOverride != false,
+            isCodingModeActive: isEffectiveCodingMode,
+            activeModelLabel: actionHint
         )
     }
+
+    private static let urlSchemePrefixes: Set<String> = [
+        "http", "https", "ftp", "ssh", "ws", "wss", "file", "localhost"
+    ]
 
     private static func isInlineEnglishWordScalar(_ scalar: UnicodeScalar) -> Bool {
         let v = scalar.value
@@ -1966,6 +2694,9 @@ public final class InputStateMachine {
         if let target = effectiveTarget {
             return triggerTranslationUpdate(snapshot: snapshot, target: target)
         }
+        if effectiveDraftModeActive {
+            return refreshDraftProofreadBuffer()
+        }
         return [.updateUI(buildPanelSnapshot(from: snapshot))]
     }
 
@@ -2020,12 +2751,28 @@ public final class InputStateMachine {
                     highlightedIndex = 0
                     return refreshComposedTranslationBuffer()
                 }
+                if effectiveDraftModeActive {
+                    // 整句暂存与校对模式：选词写入底部暂存区并触发整体错字纠偏，不提前上屏；
+                    // 若草稿为空且选中的是纯英文/ASCII词（不含汉字，如万象英文词 hello / git），直接上屏并允许触发双语后继联想！
+                    if !draftChineseBuffer.isEmpty || Self.containsHanzi(committed) {
+                        appendToDraftBuffer(committed)
+                        rankedItems = []
+                        firstPageRescuedTexts.removeAll()
+                        highlightedIndex = 0
+                        return refreshDraftProofreadBuffer()
+                    }
+                    return finishCommit(
+                        text: committed,
+                        requestPredictions: Self.endsWithAlphanumeric(committed),
+                        recordedPinyin: effectiveRecordPinyin
+                    )
+                }
                 return finishCommit(text: committed, requestPredictions: true, recordedPinyin: effectiveRecordPinyin)
             }
             return afterEngineUpdate(nextSnap)
         }
 
-        // 3. 若该候选是「当前文本框索引 / 工作记忆 / 个人记忆」独立合成注入（均已通过 coversFullQuery 整段覆盖守卫）
+        // 3. 若该候选是「中英混输 / 英文纠错 / 当前文本框索引 / 工作记忆 / 个人记忆」独立合成注入（均已通过 coversFullQuery 整段覆盖守卫）
         if let chosenItem {
             let fullWord = snapshot.selectedPrefix + chosenItem.candidate.text
             engine.clearComposition()
@@ -2036,10 +2783,36 @@ public final class InputStateMachine {
                 composedChineseBuffer.append(fullWord)
                 return refreshComposedTranslationBuffer()
             }
+            if effectiveDraftModeActive {
+                if !draftChineseBuffer.isEmpty || Self.containsHanzi(fullWord) {
+                    appendToDraftBuffer(fullWord)
+                    return refreshDraftProofreadBuffer()
+                }
+                return finishCommit(
+                    text: fullWord,
+                    requestPredictions: Self.endsWithAlphanumeric(fullWord),
+                    recordedPinyin: effectiveRecordPinyin
+                )
+            }
             return finishCommit(text: fullWord, requestPredictions: true, recordedPinyin: effectiveRecordPinyin)
         }
 
         return [.updateUI(buildPanelSnapshot(from: snapshot))]
+    }
+
+    private static func containsHanzi(_ text: String) -> Bool {
+        text.unicodeScalars.contains {
+            (0x4E00...0x9FFF).contains($0.value)
+                || (0x3400...0x4DBF).contains($0.value)
+                || (0x20000...0x2A6DF).contains($0.value)
+        }
+    }
+
+    private static func endsWithAlphanumeric(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.last else {
+            return false
+        }
+        return CharacterSet.alphanumerics.contains(last)
     }
 
     private func recordImplicitAcceptanceIfTopCandidate(snapshot: PinyinEngineSnapshot) {
@@ -2081,6 +2854,19 @@ public final class InputStateMachine {
                 firstPageRescuedTexts.removeAll()
                 return refreshComposedTranslationBuffer()
             }
+            if effectiveDraftModeActive {
+                if !draftChineseBuffer.isEmpty || Self.containsHanzi(committed) {
+                    appendToDraftBuffer(committed)
+                    rankedItems = []
+                    firstPageRescuedTexts.removeAll()
+                    return refreshDraftProofreadBuffer()
+                }
+                return finishCommit(
+                    text: committed,
+                    requestPredictions: Self.endsWithAlphanumeric(committed),
+                    recordedPinyin: activeSegmentPinyin(from: snapshot)
+                )
+            }
             return finishCommit(text: committed, requestPredictions: true, recordedPinyin: activeSegmentPinyin(from: snapshot))
         }
 
@@ -2090,7 +2876,12 @@ public final class InputStateMachine {
             if !composedChineseBuffer.isEmpty && effectiveTranslationTarget != nil {
                 return refreshComposedTranslationBuffer()
             }
+            if !draftChineseBuffer.isEmpty && effectiveDraftModeActive {
+                return refreshDraftProofreadBuffer()
+            }
             translationPreview = .hidden
+            draftProofreadState = .idle
+            pendingAIDraftSourceText = nil
             inlineOverrideTarget = nil
             suppressTranslateForCurrentSentence = false
             return [.cancelPendingInference, .updateUI(.empty)]
@@ -2099,6 +2890,7 @@ public final class InputStateMachine {
         // L1 同步多信号融合排序（< 1.2ms，零闪烁；第 2 页+ 走纯翻页模式不重复注入记忆词）
         let segmentPinyin = activeSegmentPinyin(from: snapshot)
         let effectiveLeft = effectiveLeftContext(with: snapshot)
+        let hitWanxiangLengthCap = snapshot.preedit.contains("已超最大输入长度")
         let recentTerms = (preferences.enableWorkingMemory && !isSecureInput)
             ? (workingMemory?.recentChineseTerms(
                 limit: 12,
@@ -2116,12 +2908,54 @@ public final class InputStateMachine {
             tagStore: tagStore,
             now: clock()
         )
-        let pendingPredMatches: [PendingPredictionCandidate] = (snapshot.pageNo == 0 && snapshot.selectedPrefix.isEmpty)
+        let pendingPredMatches: [PendingPredictionCandidate] = (snapshot.pageNo == 0 && snapshot.selectedPrefix.isEmpty && !hitWanxiangLengthCap)
             ? matchingPendingPredictions(for: segmentPinyin, leftContext: effectiveLeft)
             : []
-        let typoCandidates: [TypoCorrectedCandidate] = (snapshot.pageNo == 0)
+        let typoCandidates: [TypoCorrectedCandidate] = (snapshot.pageNo == 0 && !hitWanxiangLengthCap)
             ? collectTypoCandidates(rawPinyin: segmentPinyin, preedit: snapshot.preedit)
             : []
+        let mixedCandidates: [MixedBilingualCandidate] = (snapshot.pageNo == 0 && !hitWanxiangLengthCap && preferences.enableMixedBilingualAssist && !isSecureInput)
+            ? mixedBilingualComposer.suggest(
+                rawPinyin: segmentPinyin,
+                preedit: snapshot.preedit,
+                rimeTopCandidate: snapshot.candidates.first?.text,
+                isCodingMode: isEffectiveCodingMode,
+                scene: currentSceneState.primaryScene,
+                allowSpellCorrection: preferences.enableAutoCorrection,
+                hasChineseTypoCorrection: !typoCandidates.isEmpty,
+                documentIndex: documentIndex,
+                workingMemory: workingMemory,
+                engine: engine,
+                maxResults: 4
+            )
+            : []
+
+        // 超长输入或 Rime 无候选自动兜底：无缝切入「单字逐选模式」，绝不丢弃已输入的整串拼音！
+        // 若已命中强中英混输/英文纠错候选，或首音节无任何单汉字候选（例如纯英文技术词 vllm / kubectl），不误切进单字逐选模式。
+        let hasFragmentedMixedRescue = mixedCandidates.contains(where: \.isFragmentedSource)
+        if preferences.enableAutoSingleCharFallback,
+           singleCharSession == nil,
+           segmentPinyin.count >= 2,
+           (hitWanxiangLengthCap || (snapshot.candidates.isEmpty && !hasFragmentedMixedRescue)) {
+            let candidateSession = SingleCharProgressiveSession(
+                initialPrefix: snapshot.selectedPrefix,
+                rawPinyin: segmentPinyin,
+                pageSize: preferences.candidatePageSize,
+                isAutoFallback: true,
+                engine: engine,
+                memoryStore: isSecureInput ? nil : memoryStore,
+                allowMemoryPromotion: preferences.enablePersonalMemory && !isSecureInput
+            )
+            if hitWanxiangLengthCap || candidateSession.hasHanziCandidatesForCurrentSyllable {
+                engine.clearComposition()
+                rankedItems = []
+                firstPageRescuedTexts.removeAll()
+                highlightedIndex = 0
+                singleCharSession = candidateSession
+                return [.cancelPendingInference, .updateUI(buildSingleCharPanelSnapshot())]
+            }
+        }
+
         rankedItems = ranker.rank(
             rimeCandidates: snapshot.candidates,
             extendedRimeCandidates: snapshot.extendedCandidates,
@@ -2129,6 +2963,7 @@ public final class InputStateMachine {
             excludedFirstPageTexts: snapshot.pageNo > 0 ? firstPageRescuedTexts : [],
             pendingPredictions: pendingPredMatches,
             typoCandidates: typoCandidates,
+            mixedBilingualCandidates: mixedCandidates,
             rawPinyin: segmentPinyin,
             leftContext: effectiveLeft,
             appBundleID: activeAppBundleID,
@@ -2166,6 +3001,27 @@ public final class InputStateMachine {
 
         let panel = buildPanelSnapshot(from: snapshot)
         let candidateTexts = rankedItems.prefix(preferences.candidatePageSize).map(\.candidate.text)
+        var actions: [InputAction] = []
+
+        if effectiveDraftModeActive {
+            let fullDraft = fullDraftChinese(from: snapshot)
+            let draftActions = evaluateDraftProofreadAndBuildActions(
+                for: fullDraft,
+                panelSnapshotBuilder: { self.buildPanelSnapshot(from: snapshot) }
+            )
+            actions.append(contentsOf: draftActions)
+            if preferences.enableNeuralRerank && snapshot.pageNo == 0 && candidateTexts.count > 1 {
+                actions.append(.requestNeuralEnhancement(
+                    sessionToken: sessionToken,
+                    pinyin: segmentPinyin,
+                    bestSentence: sentence,
+                    candidates: candidateTexts,
+                    translationTarget: nil
+                ))
+            }
+            return actions
+        }
+
         let shouldRequestNeural = (effectiveTarget != nil) || (preferences.enableNeuralRerank && snapshot.pageNo == 0)
         if shouldRequestNeural {
             return [
@@ -2231,16 +3087,26 @@ public final class InputStateMachine {
     }
 
     private func refreshAfterModeChange() -> [InputAction] {
+        if singleCharSession != nil {
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+        }
         let snap = engine.currentSnapshot()
-        if !snap.isComposing && composedChineseBuffer.isEmpty {
-            let showBar = effectiveTranslationTarget != nil
+        if !snap.isComposing && composedChineseBuffer.isEmpty && draftChineseBuffer.isEmpty {
+            let showTrans = effectiveTranslationTarget != nil
+            let showDraft = effectiveDraftModeActive
             return [.updateUI(CandidatePanelSnapshot(
-                isVisible: true,
+                isVisible: showTrans || showDraft || isLanguagePickerOpen,
                 mode: mode,
                 preedit: "",
-                showTranslationBar: showBar,
+                showTranslationBar: showTrans,
                 translationSourcePreview: "",
                 translationPreview: .hidden,
+                showDraftBar: showDraft,
+                draftSourcePreview: "",
+                draftCommittedLength: 0,
+                draftProofreadState: .idle,
+                draftSpaceCommitsDraft: preferences.draftSpaceBehavior == .stageThenCommit,
+                isGlobalDraftMode: mode.isDraftProofread && inlineDraftOverride != false,
                 showLanguagePicker: isLanguagePickerOpen,
                 languagePickerHighlightedIndex: languagePickerIndex,
                 isCodingModeActive: isEffectiveCodingMode,
@@ -2250,7 +3116,47 @@ public final class InputStateMachine {
         if !snap.isComposing && !composedChineseBuffer.isEmpty {
             return refreshComposedTranslationBuffer()
         }
+        if !snap.isComposing && !draftChineseBuffer.isEmpty {
+            return refreshDraftProofreadBuffer()
+        }
         return afterEngineUpdate(snap)
+    }
+
+    /// 供异步收口提交（如短超时草稿 AI 纠偏上屏）同步写入短期工作记忆与自动造词
+    public func recordAsyncCommittedText(_ text: String) {
+        _ = recordCommittedToMemory(text: text, recordedPinyin: nil, leftContext: currentLeftContext)
+    }
+
+    private func recordCommittedToMemory(
+        text: String,
+        recordedPinyin: String?,
+        leftContext: String
+    ) -> String? {
+        guard !text.isEmpty, !isSecureInput, preferences.enableWorkingMemory, let wm = workingMemory else {
+            return nil
+        }
+        let now = clock()
+        guard let promoted = wm.recordCommitted(
+            text: text,
+            pinyin: recordedPinyin,
+            leftContext: leftContext,
+            appBundleID: activeAppBundleID,
+            isSecureInput: isSecureInput,
+            enableAutoPhrase: preferences.enableAutoPhraseLearning,
+            now: now
+        ) else {
+            return nil
+        }
+        if preferences.enablePersonalMemory, preferences.enableAutoPhraseLearning {
+            memoryStore?.recordLearnedPhrase(
+                phrase: promoted.phrase,
+                fullPinyin: promoted.fullPinyin,
+                initials: promoted.initials,
+                isSecureInput: isSecureInput,
+                now: now
+            )
+        }
+        return promoted.phrase
     }
 
     private func finishCommit(
@@ -2261,6 +3167,12 @@ public final class InputStateMachine {
         sessionToken &+= 1
         engine.clearComposition()
         composedChineseBuffer = ""
+        draftChineseBuffer = ""
+        draftSegmentLengths = []
+        draftProofreadState = .idle
+        pendingAIDraftSourceText = nil
+        inlineDraftOverride = nil
+        singleCharSession = nil
         rankedItems = []
         firstPageRescuedTexts.removeAll()
         pendingPredictionSnapshot = nil
@@ -2272,30 +3184,11 @@ public final class InputStateMachine {
         globalTranslateBeforeLastTab = false
         isLanguagePickerOpen = false
         let committedLeftContext = currentLeftContext
-        var promotedPhrase: String?
-        if !text.isEmpty, !isSecureInput, preferences.enableWorkingMemory, let wm = workingMemory {
-            let now = clock()
-            if let promoted = wm.recordCommitted(
-                text: text,
-                pinyin: recordedPinyin,
-                leftContext: committedLeftContext,
-                appBundleID: activeAppBundleID,
-                isSecureInput: isSecureInput,
-                enableAutoPhrase: preferences.enableAutoPhraseLearning,
-                now: now
-            ) {
-                promotedPhrase = promoted.phrase
-                if preferences.enablePersonalMemory, preferences.enableAutoPhraseLearning {
-                    memoryStore?.recordLearnedPhrase(
-                        phrase: promoted.phrase,
-                        fullPinyin: promoted.fullPinyin,
-                        initials: promoted.initials,
-                        isSecureInput: isSecureInput,
-                        now: now
-                    )
-                }
-            }
-        }
+        let promotedPhrase = recordCommittedToMemory(
+            text: text,
+            recordedPinyin: recordedPinyin,
+            leftContext: committedLeftContext
+        )
         if let p = recordedPinyin, !p.isEmpty, !text.isEmpty, !isSecureInput {
             lastCommitRecord = LastCommitRecord(
                 pinyin: p,
@@ -2324,6 +3217,12 @@ public final class InputStateMachine {
         sessionToken &+= 1
         engine.clearComposition()
         composedChineseBuffer = ""
+        draftChineseBuffer = ""
+        draftSegmentLengths = []
+        draftProofreadState = .idle
+        pendingAIDraftSourceText = nil
+        inlineDraftOverride = nil
+        singleCharSession = nil
         rankedItems = []
         firstPageRescuedTexts.removeAll()
         pendingPredictionSnapshot = nil
@@ -2360,6 +3259,13 @@ public final class InputStateMachine {
         composedChineseBuffer + currentSegmentSentence(from: snapshot)
     }
 
+    private func fullDraftChinese(from snapshot: PinyinEngineSnapshot) -> String {
+        if let sc = singleCharSession {
+            return draftChineseBuffer + sc.currentPreviewText
+        }
+        return draftChineseBuffer + currentSegmentSentence(from: snapshot)
+    }
+
     private func activeSegmentPinyin(from snapshot: PinyinEngineSnapshot) -> String {
         if snapshot.selectedPrefix.isEmpty {
             let raw = snapshot.rawInput.isEmpty ? snapshot.preedit : snapshot.rawInput
@@ -2377,7 +3283,429 @@ public final class InputStateMachine {
     }
 
     private func effectiveLeftContext(with snapshot: PinyinEngineSnapshot) -> String {
-        currentLeftContext + composedChineseBuffer + snapshot.selectedPrefix
+        currentLeftContext + composedChineseBuffer + draftChineseBuffer + snapshot.selectedPrefix
+    }
+
+    // MARK: - 整句暂存校对辅助
+
+    private func appendToDraftBuffer(_ segment: String) {
+        guard !segment.isEmpty else { return }
+        draftChineseBuffer.append(segment)
+        draftSegmentLengths.append(segment.count)
+    }
+
+    private func removeLastDraftCharacter() {
+        guard !draftChineseBuffer.isEmpty else { return }
+        draftChineseBuffer.removeLast()
+        if !draftSegmentLengths.isEmpty {
+            let lastIdx = draftSegmentLengths.count - 1
+            if draftSegmentLengths[lastIdx] > 1 {
+                draftSegmentLengths[lastIdx] -= 1
+            } else {
+                draftSegmentLengths.removeLast()
+            }
+        }
+    }
+
+    private func popLastDraftSegment() {
+        guard !draftChineseBuffer.isEmpty else { return }
+        let removeCount = draftSegmentLengths.popLast() ?? 1
+        let clamped = min(removeCount, draftChineseBuffer.count)
+        draftChineseBuffer.removeLast(clamped)
+    }
+
+    private func commitDraftWithProofread(snapshot: PinyinEngineSnapshot) -> [InputAction] {
+        let rawDraft = fullDraftChinese(from: snapshot)
+        guard !rawDraft.isEmpty else { return resetSession() }
+        let fallback = resolvedProofreadCommitText(for: rawDraft)
+
+        // 若当前草稿仍有尚未回包的异步 AI 校对请求（例如快打后 <280ms 直接回车），
+        // 走短超时即时收口路径避免漏纠；若 AI 已返回或已继承有效 AI 纠偏，则 0ms 瞬时上屏
+        if preferences.enableAIDraftProofread,
+           !isSecureInput,
+           let pendingAI = pendingAIDraftSourceText,
+           !pendingAI.isEmpty {
+            let needsWaitForAI: Bool
+            switch draftProofreadState {
+            case .checking:
+                needsWaitForAI = true
+            case .suggested(_, _, _, _, _, let label):
+                needsWaitForAI = (label == "规则")
+            default:
+                needsWaitForAI = false
+            }
+            if needsWaitForAI {
+                return finishDraftAsyncCommit(
+                    rawDraft: rawDraft,
+                    aiSourceText: pendingAI,
+                    fallbackText: fallback
+                )
+            }
+        }
+
+        return finishCommit(
+            text: fallback,
+            requestPredictions: true,
+            recordedPinyin: activeSegmentPinyin(from: snapshot)
+        )
+    }
+
+    private func finishDraftAsyncCommit(
+        rawDraft: String,
+        aiSourceText: String,
+        fallbackText: String
+    ) -> [InputAction] {
+        sessionToken &+= 1
+        engine.clearComposition()
+        composedChineseBuffer = ""
+        draftChineseBuffer = ""
+        draftSegmentLengths = []
+        draftProofreadState = .idle
+        pendingAIDraftSourceText = nil
+        inlineDraftOverride = nil
+        singleCharSession = nil
+        rankedItems = []
+        firstPageRescuedTexts.removeAll()
+        pendingPredictionSnapshot = nil
+        highlightedIndex = 0
+        translationPreview = .hidden
+        inlineOverrideTarget = nil
+        suppressTranslateForCurrentSentence = false
+        lastComposingTabTimestamp = 0
+        globalTranslateBeforeLastTab = false
+        isLanguagePickerOpen = false
+        lastCommitRecord = nil
+        return [
+            .cancelPendingInference,
+            .updateUI(.empty),
+            .commitDraftProofreadAsync(
+                rawDraft: rawDraft,
+                aiSourceText: aiSourceText,
+                fallbackText: fallbackText,
+                requestPredictions: preferences.enableContinuationPrediction
+            )
+        ]
+    }
+
+    private func resolvedProofreadCommitText(for rawDraft: String) -> String {
+        if case .suggested(let source, let corrected, _, _, _, _) = draftProofreadState,
+           source == rawDraft,
+           !corrected.isEmpty {
+            return corrected
+        }
+        let rule = proofreadEngine.applyRuleProofread(to: rawDraft)
+        return rule.hasChanges ? rule.correctedText : rawDraft
+    }
+
+    private func refreshDraftProofreadBuffer() -> [InputAction] {
+        sessionToken &+= 1
+        let snap = engine.currentSnapshot()
+        let fullDraft = fullDraftChinese(from: snap)
+        guard !fullDraft.isEmpty else {
+            return resetSession()
+        }
+        return evaluateDraftProofreadAndBuildActions(
+            for: fullDraft,
+            panelSnapshotBuilder: {
+                if self.singleCharSession != nil {
+                    return self.buildSingleCharPanelSnapshot()
+                }
+                return self.buildPanelSnapshot(from: snap)
+            }
+        )
+    }
+
+    private static let trailingPunctuationCharacters: Set<Character> = Set(
+        "，。！？；：、,.!?;: ”’）)」』】…—~"
+    )
+
+    private static func isTrailingPunctuationOnly(_ suffix: String) -> Bool {
+        guard !suffix.isEmpty, suffix.count <= 2 else { return false }
+        return suffix.allSatisfy { trailingPunctuationCharacters.contains($0) }
+    }
+
+    private func evaluateDraftProofreadAndBuildActions(
+        for fullDraft: String,
+        panelSnapshotBuilder: () -> CandidatePanelSnapshot
+    ) -> [InputAction] {
+        let previousState = draftProofreadState
+        let ruleRes = proofreadEngine.applyRuleProofread(to: fullDraft)
+        let aiSourceText = ruleRes.hasChanges ? ruleRes.correctedText : fullDraft
+        let trimmed = aiSourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasHanzi = trimmed.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+        let shouldAskAI = preferences.enableAIDraftProofread
+            && !isSecureInput
+            && trimmed.count >= 4
+            && hasHanzi
+
+        // 句末追加标点零闪烁继承：若此前已得到 AI 纠偏建议，顺手补「？」「。」等标点后立即继承前缀纠偏结果，
+        // 既避免卡片闪烁回「校对中」，又保证用户紧接按回车 0ms 直接上屏带标点的纠偏整句！
+        var inheritedAISuggestion = false
+        if case .suggested(let prevSource, let prevCorrected, _, _, let prevLat, let prevLabel) = previousState,
+           prevLabel != "规则",
+           fullDraft.hasPrefix(prevSource),
+           fullDraft.count > prevSource.count {
+            let trailing = String(fullDraft.dropFirst(prevSource.count))
+            if Self.isTrailingPunctuationOnly(trailing) {
+                let candidateCorrected = prevCorrected + trailing
+                let diff = DraftProofreadEngine.buildDiff(source: fullDraft, corrected: candidateCorrected)
+                if diff.changeCount > 0 && candidateCorrected != fullDraft {
+                    draftProofreadState = .suggested(
+                        sourceText: fullDraft,
+                        correctedText: candidateCorrected,
+                        segments: diff.segments,
+                        changeCount: diff.changeCount,
+                        latencyMs: prevLat,
+                        backendLabel: prevLabel
+                    )
+                    inheritedAISuggestion = true
+                }
+            }
+        }
+
+        if inheritedAISuggestion {
+            // 已继承完整 AI 纠偏，回车可直接 0ms 上屏；后台仍发一次静默复核以覆盖极少数标点影响语义的场景
+            pendingAIDraftSourceText = nil
+        } else if ruleRes.hasChanges {
+            draftProofreadState = .suggested(
+                sourceText: fullDraft,
+                correctedText: ruleRes.correctedText,
+                segments: ruleRes.segments,
+                changeCount: ruleRes.changeCount,
+                latencyMs: 0.2,
+                backendLabel: "规则"
+            )
+            pendingAIDraftSourceText = shouldAskAI ? aiSourceText : nil
+        } else if shouldAskAI {
+            draftProofreadState = .checking(sourceText: fullDraft)
+            pendingAIDraftSourceText = aiSourceText
+        } else if trimmed.count >= 2 && hasHanzi {
+            draftProofreadState = .clean(sourceText: fullDraft, latencyMs: 0.1, backendLabel: "规则")
+            pendingAIDraftSourceText = nil
+        } else {
+            draftProofreadState = .idle
+            pendingAIDraftSourceText = nil
+        }
+
+        let panel = panelSnapshotBuilder()
+        if shouldAskAI {
+            return [
+                .updateUI(panel),
+                .requestDraftProofread(sessionToken: sessionToken, draftText: aiSourceText)
+            ]
+        }
+        return [.updateUI(panel)]
+    }
+
+    // MARK: - 单字逐选模式按键与快照构建
+
+    private func handleSingleCharKey(_ event: NormalizedKeyEvent) -> [InputAction] {
+        guard let sc = singleCharSession else { return [.passThrough] }
+        switch event.kind {
+        case .escape:
+            singleCharSession = nil
+            if !draftChineseBuffer.isEmpty && effectiveDraftModeActive {
+                return refreshDraftProofreadBuffer()
+            }
+            if !composedChineseBuffer.isEmpty && effectiveTranslationTarget != nil {
+                return refreshComposedTranslationBuffer()
+            }
+            return resetSession()
+
+        case .arrowLeft:
+            if event.modifiers.contains(.shift) {
+                sc.adjustSyllableBoundary(delta: -1)
+            } else {
+                sc.moveHighlight(delta: -1)
+            }
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .arrowRight:
+            if event.modifiers.contains(.shift) {
+                sc.adjustSyllableBoundary(delta: 1)
+            } else {
+                sc.moveHighlight(delta: 1)
+            }
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .arrowUp:
+            sc.moveHighlight(delta: -1)
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .arrowDown:
+            sc.moveHighlight(delta: 1)
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .character("-", _), .pageUp:
+            sc.changePage(forward: false)
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .character("=", _), .pageDown:
+            sc.changePage(forward: true)
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .space:
+            return pickSingleCharCandidate(at: sc.highlightedIndex)
+
+        case .character(let ch, _) where ch.count == 1 && ch >= "1" && ch <= "9":
+            let idx = Int(ch)! - 1
+            return pickSingleCharCandidate(at: idx)
+
+        case .backspace:
+            let keepGoing = sc.handleBackspace()
+            if !keepGoing {
+                singleCharSession = nil
+                if !draftChineseBuffer.isEmpty && effectiveDraftModeActive {
+                    return refreshDraftProofreadBuffer()
+                }
+                if !composedChineseBuffer.isEmpty && effectiveTranslationTarget != nil {
+                    return refreshComposedTranslationBuffer()
+                }
+                return resetSession()
+            }
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        case .returnKey:
+            let finalized = sc.selectedText.isEmpty ? sc.currentPreviewText : sc.selectedText
+            singleCharSession = nil
+            if effectiveDraftModeActive {
+                if !finalized.isEmpty {
+                    appendToDraftBuffer(finalized)
+                }
+                if event.modifiers.contains(.shift) {
+                    return commitCurrentDraftOriginal()
+                }
+                return commitCurrentDraftProofread()
+            }
+            if let target = effectiveTranslationTarget {
+                let src = composedChineseBuffer + finalized
+                if event.modifiers.contains(.shift) {
+                    return finishCommit(text: src, requestPredictions: true, recordedPinyin: nil)
+                }
+                let cached = readyCachedTranslation(for: src, target: target)
+                return finishTranslationCommit(sourceText: src, target: target, cached: cached)
+            }
+            return finishCommit(text: finalized, requestPredictions: true, recordedPinyin: nil)
+
+        case .character(let ch, _):
+            guard let scalar = ch.unicodeScalars.first else { return [.passThrough] }
+            if ch.count == 1, scalar.value >= 97 && scalar.value <= 122 {
+                sc.appendLetter(Character(ch))
+                return [.updateUI(buildSingleCharPanelSnapshot())]
+            }
+            if SmartPunctuationEngine.isMappedPunctuationKey(ch) {
+                let finalized = sc.selectedText.isEmpty ? sc.currentPreviewText : sc.selectedText
+                singleCharSession = nil
+                let punct = punctuationEngine.mapPunctuation(
+                    ch,
+                    context: .init(
+                        mode: mode,
+                        preferences: preferences,
+                        appBundleID: activeAppBundleID,
+                        leftContext: currentLeftContext + draftChineseBuffer + composedChineseBuffer + finalized,
+                        isInsideChineseTranslationBuffer: effectiveTranslationTarget != nil
+                    )
+                ) ?? ch
+                return routeCompletedSingleCharText(finalized + punct)
+            }
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+
+        default:
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+        }
+    }
+
+    private func pickSingleCharCandidate(at index: Int) -> [InputAction] {
+        guard let sc = singleCharSession else { return [] }
+        let syllable = sc.currentSyllable
+        let page = sc.currentPageCandidates
+        guard page.indices.contains(index) else {
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+        }
+        let chosenChar = page[index].text
+        if preferences.enablePersonalMemory, !isSecureInput, !syllable.isEmpty {
+            memoryStore?.recordSelection(
+                pinyin: syllable,
+                chosenWord: chosenChar,
+                selectedRank: index,
+                skippedTopWord: index > 0 ? page.first?.text : nil,
+                chosenFeatures: nil,
+                skippedTopFeatures: nil,
+                leftContext: currentLeftContext + draftChineseBuffer + composedChineseBuffer + sc.selectedText,
+                appBundleID: activeAppBundleID,
+                isSecureInput: isSecureInput,
+                now: clock()
+            )
+        }
+
+        guard let outcome = sc.pickCandidateOnCurrentPage(index: index) else {
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+        }
+        switch outcome {
+        case .advanced:
+            sessionToken &+= 1
+            return [.updateUI(buildSingleCharPanelSnapshot())]
+        case .completed(let fullText):
+            singleCharSession = nil
+            return routeCompletedSingleCharText(fullText)
+        }
+    }
+
+    private func routeCompletedSingleCharText(_ text: String) -> [InputAction] {
+        guard !text.isEmpty else { return resetSession() }
+        if effectiveTranslationTarget != nil {
+            composedChineseBuffer.append(text)
+            return refreshComposedTranslationBuffer()
+        }
+        if effectiveDraftModeActive {
+            appendToDraftBuffer(text)
+            return refreshDraftProofreadBuffer()
+        }
+        return finishCommit(text: text, requestPredictions: true, recordedPinyin: nil)
+    }
+
+    private func buildSingleCharPanelSnapshot() -> CandidatePanelSnapshot {
+        guard let sc = singleCharSession else { return .empty }
+        let isTranslate = (effectiveTranslationTarget != nil)
+        let isDraft = effectiveDraftModeActive
+        let pageCands = sc.currentPageCandidates
+        let prefixBuf = isTranslate ? composedChineseBuffer : draftChineseBuffer
+        let displayPreedit = prefixBuf.isEmpty
+            ? sc.formattedPreedit
+            : "\(prefixBuf) \(sc.formattedPreedit)"
+        let draftPreview = isDraft ? (draftChineseBuffer + sc.currentPreviewText) : ""
+
+        return CandidatePanelSnapshot(
+            isVisible: true,
+            mode: isTranslate ? .translateOnCommit(effectiveTranslationTarget ?? preferredTargetLanguage) : (isDraft ? .draftProofread : .chinesePinyin),
+            preedit: displayPreedit,
+            selectedText: prefixBuf + sc.selectedText,
+            candidates: pageCands,
+            highlightedIndex: min(sc.highlightedIndex, max(0, pageCands.count - 1)),
+            pageNo: sc.pageNo,
+            hasNextPage: sc.hasNextPage,
+            showTranslationBar: isTranslate,
+            translationSourcePreview: isTranslate ? (composedChineseBuffer + sc.currentPreviewText) : "",
+            translationPreview: translationPreview,
+            translateSpaceCommitsTranslation: preferences.translateSpaceBehavior == .commitTranslation,
+            isGlobalTranslateMode: (mode.translationTarget != nil && !suppressTranslateForCurrentSentence),
+            showDraftBar: isDraft,
+            draftSourcePreview: draftPreview,
+            draftCommittedLength: draftChineseBuffer.count,
+            draftProofreadState: draftProofreadState,
+            draftSpaceCommitsDraft: preferences.draftSpaceBehavior == .stageThenCommit,
+            isGlobalDraftMode: mode.isDraftProofread && inlineDraftOverride != false,
+            isSingleCharMode: true,
+            singleCharProgressHint: sc.progressHint,
+            canToggleSingleCharMode: true,
+            showLanguagePicker: false,
+            languagePickerHighlightedIndex: 0,
+            isCodingModeActive: isEffectiveCodingMode,
+            activeScene: currentSceneState.primaryScene,
+            isSceneLocked: currentSceneState.isLocked,
+            predictions: [],
+            activeModelLabel: sc.progressHint
+        )
     }
 
     private func readyCachedTranslation(for source: String, target: TargetLanguage) -> String? {
@@ -2399,6 +3727,7 @@ public final class InputStateMachine {
             return mode
         }()
         let isTranslate = (effectiveMode.translationTarget != nil)
+        let isDraft = effectiveDraftModeActive
         let rawDisplayCandidates = rankedItems.isEmpty ? snap.candidates : rankedItems.map(\.candidate)
         let displayCandidates: [PinyinCandidate]
         if let tagStore, !rawDisplayCandidates.isEmpty {
@@ -2412,23 +3741,26 @@ public final class InputStateMachine {
         } else {
             displayCandidates = rawDisplayCandidates
         }
+        let leadingBuffer = isTranslate ? composedChineseBuffer : draftChineseBuffer
         let displayPreedit: String = {
-            if composedChineseBuffer.isEmpty {
+            if leadingBuffer.isEmpty {
                 return snap.preedit
             }
             if snap.preedit.isEmpty {
-                return composedChineseBuffer
+                return leadingBuffer
             }
-            return composedChineseBuffer + " " + snap.preedit
+            return leadingBuffer + " " + snap.preedit
         }()
         let sourcePreview = isTranslate ? fullComposedChinese(from: snap) : ""
-        let visible = snap.isComposing || !composedChineseBuffer.isEmpty || isLanguagePickerOpen
+        let draftPreview = isDraft ? fullDraftChinese(from: snap) : ""
+        let segPinyinLen = activeSegmentPinyin(from: snap).count
+        let visible = snap.isComposing || !composedChineseBuffer.isEmpty || !draftChineseBuffer.isEmpty || isLanguagePickerOpen
 
         return CandidatePanelSnapshot(
             isVisible: visible,
-            mode: effectiveMode,
+            mode: isDraft && !isTranslate ? .draftProofread : effectiveMode,
             preedit: displayPreedit,
-            selectedText: composedChineseBuffer + snap.selectedPrefix,
+            selectedText: leadingBuffer + snap.selectedPrefix,
             candidates: displayCandidates,
             highlightedIndex: min(highlightedIndex, max(0, displayCandidates.count - 1)),
             pageNo: snap.pageNo,
@@ -2438,6 +3770,15 @@ public final class InputStateMachine {
             translationPreview: translationPreview,
             translateSpaceCommitsTranslation: preferences.translateSpaceBehavior == .commitTranslation,
             isGlobalTranslateMode: (mode.translationTarget != nil && !suppressTranslateForCurrentSentence),
+            showDraftBar: isDraft && (snap.isComposing || !draftChineseBuffer.isEmpty),
+            draftSourcePreview: draftPreview,
+            draftCommittedLength: draftChineseBuffer.count,
+            draftProofreadState: draftProofreadState,
+            draftSpaceCommitsDraft: preferences.draftSpaceBehavior == .stageThenCommit,
+            isGlobalDraftMode: (mode.isDraftProofread && inlineDraftOverride != false),
+            isSingleCharMode: false,
+            singleCharProgressHint: "",
+            canToggleSingleCharMode: snap.isComposing && segPinyinLen >= 2,
             showLanguagePicker: isLanguagePickerOpen,
             languagePickerHighlightedIndex: languagePickerIndex,
             isCodingModeActive: isEffectiveCodingMode,
@@ -2452,6 +3793,10 @@ public final class InputStateMachine {
         switch mode {
         case .directEnglish: return "EN"
         case .chinesePinyin: return "拼 · ⇧⏎ 译英"
+        case .draftProofread:
+            return preferences.draftSpaceBehavior == .stageThenCommit
+                ? "校 · ␣ 进草稿/上屏"
+                : "校 · ⏎ 上屏整句"
         case .translateOnCommit(let lang):
             return preferences.translateSpaceBehavior == .commitTranslation
                 ? "中→\(lang.shortBadge) · ␣ 译文"

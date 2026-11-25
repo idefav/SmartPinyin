@@ -50,7 +50,27 @@ public enum InputSourceManager {
         }
     }
 
-    /// 注册并尝试自动启用、选中 SmartPinyin 输入源
+    /// 异步注册并自动启用输入源（不阻塞主线程，并在首次 TSM 刷新延迟时自动短间隔重试一次）
+    @discardableResult
+    public static func registerAndEnableAsync(bundleURL: URL) async -> InputSourceStatus {
+        _ = await MainActor.run {
+            TISRegisterInputSource(bundleURL as CFURL)
+        }
+        try? await Task.sleep(for: .milliseconds(250))
+        var status = await MainActor.run {
+            enableAndSelectOnMain()
+        }
+        if !status.isEnabled {
+            try? await Task.sleep(for: .milliseconds(350))
+            status = await MainActor.run {
+                _ = TISRegisterInputSource(bundleURL as CFURL)
+                return enableAndSelectOnMain()
+            }
+        }
+        return status
+    }
+
+    /// 注册并尝试自动启用、选中 SmartPinyin 输入源（后台线程调用时自带一次 TSM 延迟重试）
     @discardableResult
     public static func registerAndEnable(bundleURL: URL) -> InputSourceStatus {
         _ = register(bundleURL: bundleURL)
@@ -59,26 +79,38 @@ public enum InputSourceManager {
             Thread.sleep(forTimeInterval: 0.25)
         }
 
-        return runOnMain {
-            let sources = matchingSourcesOnMain(includeAllInstalled: true)
-            // 先启用父级输入法，再启用子级拼音模式
-            let ordered = sources.sorted { lhs, rhs in
-                let lID = stringProperty(lhs, key: kTISPropertyInputSourceID) ?? ""
-                let rID = stringProperty(rhs, key: kTISPropertyInputSourceID) ?? ""
-                return lID.count < rID.count
-            }
-            for src in ordered {
-                _ = TISEnableInputSource(src)
-            }
-            // 尝试切到拼音模式
-            if let pinyinSource = ordered.first(where: {
-                stringProperty($0, key: kTISPropertyInputSourceID) == pinyinModeID
-            }) ?? ordered.last {
-                _ = TISSelectInputSource(pinyinSource)
-            }
-            invalidateUIOrderCache()
-            return currentStatusOnMain()
+        var status = runOnMain {
+            enableAndSelectOnMain()
         }
+        if !status.isEnabled && !Thread.isMainThread {
+            Thread.sleep(forTimeInterval: 0.35)
+            status = runOnMain {
+                _ = TISRegisterInputSource(bundleURL as CFURL)
+                return enableAndSelectOnMain()
+            }
+        }
+        return status
+    }
+
+    private static func enableAndSelectOnMain() -> InputSourceStatus {
+        let sources = matchingSourcesOnMain(includeAllInstalled: true)
+        // 先启用父级输入法，再启用子级拼音模式
+        let ordered = sources.sorted { lhs, rhs in
+            let lID = stringProperty(lhs, key: kTISPropertyInputSourceID) ?? ""
+            let rID = stringProperty(rhs, key: kTISPropertyInputSourceID) ?? ""
+            return lID.count < rID.count
+        }
+        for src in ordered {
+            _ = TISEnableInputSource(src)
+        }
+        // 尝试切到拼音模式
+        if let pinyinSource = ordered.first(where: {
+            stringProperty($0, key: kTISPropertyInputSourceID) == pinyinModeID
+        }) ?? ordered.last {
+            _ = TISSelectInputSource(pinyinSource)
+        }
+        invalidateUIOrderCache()
+        return currentStatusOnMain()
     }
 
     /// 清除系统菜单栏输入源 UI 顺序缓存（AppleInputSourcesInUIOrderPasteboard），
@@ -91,23 +123,16 @@ public enum InputSourceManager {
         }
     }
 
-    /// 清除 UI 顺序缓存并刷新菜单栏输入法代理进程，使新增/变更的输入源立即可见
+    /// 清除 UI 顺序缓存并温和刷新菜单栏输入法代理进程，使新增/变更的输入源立即可见（避免 SIGKILL 强杀其他系统 UI 进程）
     public static func refreshSystemInputMenu() {
         invalidateUIOrderCache()
-        let targets: [(String, [String])] = [
-            ("/usr/bin/pkill", ["-x", "TextInputMenuAgent"]),
-            ("/usr/bin/pkill", ["-9", "-x", "TextInputSwitcher"]),
-            ("/usr/bin/pkill", ["-9", "-x", "CursorUIViewService"])
-        ]
-        for (exe, args) in targets {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: exe)
-            proc.arguments = args
-            proc.standardOutput = FileHandle.nullDevice
-            proc.standardError = FileHandle.nullDevice
-            try? proc.run()
-            proc.waitUntilExit()
-        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        proc.arguments = ["-x", "TextInputMenuAgent"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
     }
 
     /// 卸载前安全停用：先将当前活跃输入法切回系统英文 ABC/US，再禁用全部 SmartPinyin 输入源

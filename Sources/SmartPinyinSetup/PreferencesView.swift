@@ -133,10 +133,30 @@ struct PreferencesView: View {
                     Toggle("输出繁体中文（简转繁）", isOn: $vm.preferences.traditionalChinese)
                     Toggle("开启简拼与声母简码（如 zgr → 中国人）", isOn: $vm.preferences.enableAbbrevPinyin)
                     Toggle("智能拼音自动纠错（纠偏错键、漏键、多键与字母倒序，如 shaighai → 上海）", isOn: $vm.preferences.enableAutoCorrection)
+                    Toggle("中英文混输、离线英文词典补全与拼写纠错（如 gitdiz → git地址 · dokcer → Docker）", isOn: $vm.preferences.enableMixedBilingualAssist)
                     Toggle("前后鼻音模糊容错（an↔ang · en↔eng · in↔ing，如 shanhai → 上海）", isOn: $vm.preferences.fuzzyNasalPinyin)
                     Toggle("平翘舌模糊容错（zh↔z · ch↔c · sh↔s）", isOn: $vm.preferences.fuzzyRetroflexPinyin)
                     Toggle("声母 n / l 与 f / h 模糊容错", isOn: $vm.preferences.fuzzyNLAndFHPinyin)
+                    Toggle("超长连续输入或找不到匹配时自动切换「单字逐选」模式（支持 ⌥C 手动随时切换）", isOn: $vm.preferences.enableAutoSingleCharFallback)
                     Toggle("候选栏显示 Emoji 表情词条", isOn: $vm.preferences.enableEmojiCandidates)
+                }
+
+                Section("整句暂存与整体错字纠偏（类翻译暂存区体验）") {
+                    Toggle("开启整句暂存与校对模式（先按空格进草稿校对，确认无误再按空格上屏）", isOn: $vm.preferences.defaultDraftProofreadMode)
+                    Toggle("暂存模式下自动使用本地 Qwen3-0.6B 做语义错字纠偏（100% 离线，零新增模型）", isOn: $vm.preferences.enableAIDraftProofread)
+                    Picker("校对模式按空格键", selection: $vm.preferences.draftSpaceBehavior) {
+                        ForEach(DraftSpaceBehavior.allCases) { behavior in
+                            Text(behavior.displayName).tag(behavior)
+                        }
+                    }
+                    Picker("一键全局开关暂存校对模式快捷键", selection: $vm.preferences.draftModeToggleShortcut) {
+                        ForEach(DraftModeToggleShortcut.allCases) { shortcut in
+                            Text(shortcut.displayName).tag(shortcut)
+                        }
+                    }
+                    Text("提示：默认拼写时按空格/1–9 选词进入底栏草稿区并自动错字纠偏，确认无误后再按一次空格（或回车）一次上屏；草稿为空时小写英文直接按回车出原词，大写/驼峰/下划线、万象英文词与 Shift+空格独立英文直接上屏不进草稿盒；按 Shift+回车 或 Option+回车 上屏原稿，按 Option+退格 撤回上一词段，也可输入行内指令 /d 随时开关。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("本地小模型增强（Qwen3-0.6B · 离线）") {

@@ -145,7 +145,14 @@ public final class PinyinNormalizer: @unchecked Sendable {
         "朝": ["chao", "zhao"],
         "称": ["cheng", "chen"],
         "处": ["chu"],
+        "单": ["dan", "shan"],
+        "的": ["de", "di"],
+        "得": ["de", "dei"],
+        "地": ["di", "de"],
+        "都": ["dou", "du"],
         "度": ["du", "duo"],
+        "查": ["cha", "zha"],
+        "秘": ["mi", "bi"],
         "发": ["fa"],
         "干": ["gan"],
         "给": ["gei", "ji"],
@@ -273,10 +280,101 @@ public final class PinyinNormalizer: @unchecked Sendable {
         }
 
         return TermPinyinKeys(
-            fullVariants: Array(Set(fullCombos)),
-            initialVariants: Array(Set(initCombos)),
+            fullVariants: Self.uniqueOrdered(fullCombos),
+            initialVariants: Self.uniqueOrdered(initCombos),
             primarySyllables: primarySyllables
         )
+    }
+
+    /// 提取中英混合或纯中文词条的统一拼音键（如 `"git地址"` -> `fullVariants: ["gitdizhi"]`, `initialVariants: ["gitdz"]`, `primarySyllables: ["git", "di", "zhi"]`）：
+    /// - 连续 ASCII 英文段作为完整音节保留（全拼与简拼中英文段均保留原英文串，以便 `gitdz` / `gitdiz` / `reactzj` 精准命中）
+    /// - 汉字按 `readingsForChar` 展开（含多音字）
+    public func keys(forMixedTerm term: String) -> TermPinyinKeys {
+        let hasASCII = term.unicodeScalars.contains {
+            ($0.value >= 65 && $0.value <= 90) || ($0.value >= 97 && $0.value <= 122)
+        }
+        guard hasASCII else {
+            return keys(forChineseTerm: term)
+        }
+
+        var unitOptions: [(readings: [String], isASCII: Bool)] = []
+        var asciiBuf = ""
+        func flushASCII() {
+            guard !asciiBuf.isEmpty else { return }
+            unitOptions.append(([asciiBuf.lowercased()], true))
+            asciiBuf = ""
+        }
+
+        for ch in term {
+            if let scalar = ch.unicodeScalars.first,
+               (scalar.value >= 65 && scalar.value <= 90) || (scalar.value >= 97 && scalar.value <= 122) {
+                asciiBuf.append(ch)
+            } else {
+                flushASCII()
+                let isCJK = ch.unicodeScalars.contains {
+                    (0x4E00...0x9FFF).contains($0.value) || (0x3400...0x4DBF).contains($0.value)
+                }
+                if isCJK {
+                    let readings = readingsForChar(ch)
+                    if !readings.isEmpty {
+                        unitOptions.append((readings, false))
+                    }
+                }
+            }
+        }
+        flushASCII()
+
+        guard !unitOptions.isEmpty else {
+            return TermPinyinKeys(fullVariants: [], initialVariants: [], primarySyllables: [])
+        }
+
+        let primarySyllables = unitOptions.map { $0.readings[0] }
+        var fullCombos: [String] = [""]
+        var initCombos: [String] = [""]
+
+        for unit in unitOptions {
+            let capped = Array(unit.readings.prefix(2))
+            if fullCombos.count * capped.count <= 8 {
+                var nextFull: [String] = []
+                var nextInit: [String] = []
+                for idx in 0..<fullCombos.count {
+                    for opt in capped {
+                        nextFull.append(fullCombos[idx] + opt)
+                        if unit.isASCII {
+                            // 混输简拼保留英文段本身（如 git地址 -> gitdz、React组件 -> reactzj）
+                            nextInit.append(initCombos[idx] + opt)
+                        } else if let first = opt.first {
+                            nextInit.append(initCombos[idx] + String(first))
+                        } else {
+                            nextInit.append(initCombos[idx])
+                        }
+                    }
+                }
+                fullCombos = nextFull
+                initCombos = nextInit
+            } else {
+                let firstOpt = capped[0]
+                let initPart = unit.isASCII ? firstOpt : (firstOpt.first.map(String.init) ?? "")
+                fullCombos = fullCombos.map { $0 + firstOpt }
+                initCombos = initCombos.map { $0 + initPart }
+            }
+        }
+
+        return TermPinyinKeys(
+            fullVariants: Self.uniqueOrdered(fullCombos),
+            initialVariants: Self.uniqueOrdered(initCombos),
+            primarySyllables: primarySyllables
+        )
+    }
+
+    private static func uniqueOrdered(_ items: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        result.reserveCapacity(items.count)
+        for item in items where seen.insert(item).inserted {
+            result.append(item)
+        }
+        return result
     }
 
     /// 提取英文/代码标识符的匹配键（全小写 + 驼峰/下划线首字母简拼）

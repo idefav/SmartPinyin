@@ -79,13 +79,19 @@ public enum TargetLanguage: String, CaseIterable, Codable, Sendable {
 public enum InputMode: Equatable, Codable, Sendable {
     case directEnglish
     case chinesePinyin
+    case draftProofread
     case translateOnCommit(TargetLanguage)
 
     public var isChineseActive: Bool {
         switch self {
         case .directEnglish: return false
-        case .chinesePinyin, .translateOnCommit: return true
+        case .chinesePinyin, .draftProofread, .translateOnCommit: return true
         }
+    }
+
+    public var isDraftProofread: Bool {
+        if case .draftProofread = self { return true }
+        return false
     }
 
     public var translationTarget: TargetLanguage? {
@@ -105,6 +111,7 @@ public enum CandidateSource: String, Codable, Sendable {
     case neuralReranked
     case neuralPrediction
     case typoCorrected
+    case mixedBilingual
 }
 
 /// 智能场景定义（支持自动感知或用户手动锁定，驱动 0ms 词库动态优先级调度）
@@ -288,6 +295,35 @@ public enum TranslationPreviewState: Equatable, Codable, Sendable {
     case failed(sourceText: String, target: TargetLanguage, reason: String)
 }
 
+/// 整句校对字符级 Diff 片段（供候选窗底栏高亮展示错字纠偏位置）
+public struct ProofreadDiffSegment: Equatable, Codable, Sendable {
+    public let text: String
+    public let isChanged: Bool
+    public let originalText: String?
+
+    public init(text: String, isChanged: Bool, originalText: String? = nil) {
+        self.text = text
+        self.isChanged = isChanged
+        self.originalText = originalText
+    }
+}
+
+/// 整句暂存与整体错字纠偏状态
+public enum DraftProofreadState: Equatable, Codable, Sendable {
+    case idle
+    case checking(sourceText: String)
+    case clean(sourceText: String, latencyMs: Double, backendLabel: String)
+    case suggested(
+        sourceText: String,
+        correctedText: String,
+        segments: [ProofreadDiffSegment],
+        changeCount: Int,
+        latencyMs: Double,
+        backendLabel: String
+    )
+    case unavailable(sourceText: String)
+}
+
 /// 候选窗渲染快照（主线程只读消费）
 public struct CandidatePanelSnapshot: Equatable, Sendable {
     public let isVisible: Bool
@@ -303,6 +339,15 @@ public struct CandidatePanelSnapshot: Equatable, Sendable {
     public let translationPreview: TranslationPreviewState
     public let translateSpaceCommitsTranslation: Bool
     public let isGlobalTranslateMode: Bool
+    public let showDraftBar: Bool
+    public let draftSourcePreview: String
+    public let draftCommittedLength: Int
+    public let draftProofreadState: DraftProofreadState
+    public let draftSpaceCommitsDraft: Bool
+    public let isGlobalDraftMode: Bool
+    public let isSingleCharMode: Bool
+    public let singleCharProgressHint: String
+    public let canToggleSingleCharMode: Bool
     public let showLanguagePicker: Bool
     public let languagePickerHighlightedIndex: Int
     public let isCodingModeActive: Bool
@@ -330,6 +375,15 @@ public struct CandidatePanelSnapshot: Equatable, Sendable {
         translationPreview: TranslationPreviewState = .hidden,
         translateSpaceCommitsTranslation: Bool = true,
         isGlobalTranslateMode: Bool = false,
+        showDraftBar: Bool = false,
+        draftSourcePreview: String = "",
+        draftCommittedLength: Int = 0,
+        draftProofreadState: DraftProofreadState = .idle,
+        draftSpaceCommitsDraft: Bool = true,
+        isGlobalDraftMode: Bool = false,
+        isSingleCharMode: Bool = false,
+        singleCharProgressHint: String = "",
+        canToggleSingleCharMode: Bool = false,
         showLanguagePicker: Bool = false,
         languagePickerHighlightedIndex: Int = 0,
         isCodingModeActive: Bool = false,
@@ -353,6 +407,15 @@ public struct CandidatePanelSnapshot: Equatable, Sendable {
         self.translationPreview = translationPreview
         self.translateSpaceCommitsTranslation = translateSpaceCommitsTranslation
         self.isGlobalTranslateMode = isGlobalTranslateMode
+        self.showDraftBar = showDraftBar
+        self.draftSourcePreview = draftSourcePreview
+        self.draftCommittedLength = draftCommittedLength
+        self.draftProofreadState = draftProofreadState
+        self.draftSpaceCommitsDraft = draftSpaceCommitsDraft
+        self.isGlobalDraftMode = isGlobalDraftMode
+        self.isSingleCharMode = isSingleCharMode
+        self.singleCharProgressHint = singleCharProgressHint
+        self.canToggleSingleCharMode = canToggleSingleCharMode
         self.showLanguagePicker = showLanguagePicker
         self.languagePickerHighlightedIndex = languagePickerHighlightedIndex
         self.isCodingModeActive = isCodingModeActive

@@ -398,6 +398,120 @@ SPMRimeCandidate* spm_rime_probe_candidates(
     return results;
 }
 
+static bool spm_is_single_cjk_utf8(const char* s) {
+    if (!s || s[0] == '\0') return false;
+    const unsigned char* p = (const unsigned char*)s;
+    uint32_t cp = 0;
+    size_t nbytes = 0;
+    if ((p[0] & 0xF0) == 0xE0) {
+        if ((p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80) return false;
+        cp = ((uint32_t)(p[0] & 0x0F) << 12) |
+             ((uint32_t)(p[1] & 0x3F) << 6) |
+             (uint32_t)(p[2] & 0x3F);
+        nbytes = 3;
+    } else if ((p[0] & 0xF8) == 0xF0) {
+        if ((p[1] & 0xC0) != 0x80 || (p[2] & 0xC0) != 0x80 || (p[3] & 0xC0) != 0x80) return false;
+        cp = ((uint32_t)(p[0] & 0x07) << 18) |
+             ((uint32_t)(p[1] & 0x3F) << 12) |
+             ((uint32_t)(p[2] & 0x3F) << 6) |
+             (uint32_t)(p[3] & 0x3F);
+        nbytes = 4;
+    } else {
+        return false;
+    }
+    // 严格确保只有这一个 Unicode 标量，不含后续字符
+    if (p[nbytes] != '\0') return false;
+    return (cp >= 0x4E00 && cp <= 0x9FFF) ||
+           (cp >= 0x3400 && cp <= 0x4DBF) ||
+           (cp >= 0x20000 && cp <= 0x2CEAF) ||
+           (cp >= 0xF900 && cp <= 0xFAFF);
+}
+
+SPMRimeCandidate* spm_rime_probe_single_chars(
+    SPMRimeEngine* engine,
+    const char* ascii_pinyin,
+    int32_t max_results,
+    int32_t* out_count
+) {
+    if (out_count) *out_count = 0;
+    if (!engine || !engine->api || !ascii_pinyin || ascii_pinyin[0] == '\0' || max_results <= 0) {
+        return NULL;
+    }
+    const int32_t cap = max_results > 96 ? 96 : max_results;
+    RimeApi* api = engine->api;
+
+    if (!engine->probe_session_id) {
+        RimeSessionId psid = api->create_session();
+        if (!psid) return NULL;
+        if (engine->preferred_schema_id && engine->preferred_schema_id[0] != '\0') {
+            api->select_schema(psid, engine->preferred_schema_id);
+        }
+        api->set_option(psid, "ascii_mode", False);
+        engine->probe_session_id = psid;
+    }
+
+    RimeSessionId psid = engine->probe_session_id;
+    api->clear_composition(psid);
+
+    if (engine->session_id) {
+        api->set_option(psid, "s2t", api->get_option(engine->session_id, "s2t"));
+        api->set_option(psid, "s2s", api->get_option(engine->session_id, "s2s"));
+    }
+    api->set_option(psid, "emoji", False);
+    api->set_option(psid, "char_priority", True);
+
+    const size_t len = strlen(ascii_pinyin);
+    const size_t max_len = len > 8 ? 8 : len;
+    for (size_t i = 0; i < max_len; ++i) {
+        unsigned char c = (unsigned char)ascii_pinyin[i];
+        if (c >= 'a' && c <= 'z') {
+            api->process_key(psid, (int32_t)c, 0);
+        }
+    }
+
+    SPMRimeCandidate* results = (SPMRimeCandidate*)calloc((size_t)cap, sizeof(SPMRimeCandidate));
+    int32_t count = 0;
+    if (results &&
+        RIME_API_AVAILABLE(api, candidate_list_begin) &&
+        RIME_API_AVAILABLE(api, candidate_list_next) &&
+        RIME_API_AVAILABLE(api, candidate_list_end)) {
+        RimeCandidateListIterator iter;
+        memset(&iter, 0, sizeof(iter));
+        if (api->candidate_list_begin(psid, &iter)) {
+            int32_t scanned = 0;
+            const int32_t kScanCap = 260;
+            while (api->candidate_list_next(&iter) && scanned < kScanCap && count < cap) {
+                scanned++;
+                const char* txt = iter.candidate.text;
+                if (!spm_is_single_cjk_utf8(txt)) continue;
+                bool dup = false;
+                for (int32_t j = 0; j < count; ++j) {
+                    if (results[j].text && strcmp(results[j].text, txt) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                results[count].text = spm_strdup_nullable(txt);
+                results[count].comment = spm_strdup_nullable(iter.candidate.comment);
+                results[count].global_index = count;
+                count++;
+            }
+            api->candidate_list_end(&iter);
+        }
+    }
+
+    api->clear_composition(psid);
+    api->set_option(psid, "char_priority", False);
+
+    if (count == 0) {
+        free(results);
+        results = NULL;
+    }
+    if (out_count) *out_count = count;
+    return results;
+}
+
 void spm_rime_free_candidates(SPMRimeCandidate* candidates, int32_t count) {
     if (!candidates) return;
     if (count > 0) {

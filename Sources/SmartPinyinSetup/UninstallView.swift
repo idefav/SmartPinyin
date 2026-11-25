@@ -50,14 +50,17 @@ struct UninstallView: View {
 
                         Toggle(isOn: $vm.uninstallOptions.removePreferencesAndLogs) {
                             HStack {
-                                Text("清除偏好设置与运行日志")
+                                Text("清除偏好设置、应用缓存与运行日志")
                                 Spacer()
+                                Text(InstallerEngine.formatBytes(usage?.preferencesAndLogsBytes ?? 0))
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
                             }
                         }
 
                         Toggle(isOn: $vm.uninstallOptions.removeUserDictionaries) {
                             HStack {
-                                Text("同时删除个人词库与用户习惯（RimeUserData）")
+                                Text("同时删除个人词库、扩展词库与偏好记忆（RimeUserData / LexiconPacks / SQLite）")
                                 Spacer()
                                 Text(InstallerEngine.formatBytes(usage?.userDictionaryBytes ?? 0))
                                     .font(.system(.caption, design: .monospaced))
@@ -110,6 +113,9 @@ struct UninstallView: View {
                     .tint(.red)
                     .controlSize(.large)
                 }
+                Text("提示：系统级安装卸载仅需一次管理员密码确认；如曾开启「辅助功能」权限且系统设置中仍保留历史条目，可在「隐私与安全性 → 辅助功能」中点「-」移除。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(24)
         }

@@ -13,6 +13,8 @@ public final class InferenceXPCClient {
     private var activePreviewTranslateRequestID: String?
     private var activeCommitTranslateRequestID: String?
     private var activePredictRequestID: String?
+    private var activeProofreadRequestID: String?
+    private var activeCommitProofreadRequestID: String?
 
     private init() {}
 
@@ -42,21 +44,30 @@ public final class InferenceXPCClient {
         guard let proxy = connection?.remoteObjectProxy as? InferenceXPCProtocol else {
             activeRerankRequestID = nil
             activePreviewTranslateRequestID = nil
-            if includeCommit { activeCommitTranslateRequestID = nil }
+            if includeCommit {
+                activeCommitTranslateRequestID = nil
+                activeCommitProofreadRequestID = nil
+            }
             activePredictRequestID = nil
+            activeProofreadRequestID = nil
             return
         }
-        var ids = [activeRerankRequestID, activePreviewTranslateRequestID, activePredictRequestID]
+        var ids = [activeRerankRequestID, activePreviewTranslateRequestID, activePredictRequestID, activeProofreadRequestID]
         if includeCommit {
             ids.append(activeCommitTranslateRequestID)
+            ids.append(activeCommitProofreadRequestID)
         }
         for id in ids.compactMap({ $0 }) {
             proxy.cancelRequest(requestID: id)
         }
         activeRerankRequestID = nil
         activePreviewTranslateRequestID = nil
-        if includeCommit { activeCommitTranslateRequestID = nil }
+        if includeCommit {
+            activeCommitTranslateRequestID = nil
+            activeCommitProofreadRequestID = nil
+        }
         activePredictRequestID = nil
+        activeProofreadRequestID = nil
     }
 
     public func rerank(
@@ -206,6 +217,57 @@ public final class InferenceXPCClient {
                 guard resumed.trySet() else { return }
                 guard let data,
                       let decoded = try? JSONDecoder().decode(TranslationReplyPayload.self, from: data)
+                else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: decoded)
+            }
+        }
+    }
+
+    public func proofreadSentence(
+        sourceText: String,
+        leftContext: String,
+        timeoutSeconds: Double = 2.2,
+        isCommitRequest: Bool = false
+    ) async -> ProofreadReplyPayload? {
+        if let prev = activeProofreadRequestID {
+            (connection?.remoteObjectProxy as? InferenceXPCProtocol)?.cancelRequest(requestID: prev)
+            activeProofreadRequestID = nil
+        }
+        if isCommitRequest, let prevCommit = activeCommitProofreadRequestID {
+            (connection?.remoteObjectProxy as? InferenceXPCProtocol)?.cancelRequest(requestID: prevCommit)
+            activeCommitProofreadRequestID = nil
+        }
+        let reqID = UUID().uuidString
+        if isCommitRequest {
+            activeCommitProofreadRequestID = reqID
+        } else {
+            activeProofreadRequestID = reqID
+        }
+
+        return await withCheckedContinuation { continuation in
+            let resumed = LockedFlag()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + max(0.15, timeoutSeconds)) {
+                if resumed.trySet() {
+                    continuation.resume(returning: nil)
+                }
+            }
+            guard let p = proxy(onError: {
+                if resumed.trySet() { continuation.resume(returning: nil) }
+            }) else {
+                if resumed.trySet() { continuation.resume(returning: nil) }
+                return
+            }
+            p.proofreadSentence(
+                sourceText: sourceText,
+                leftContext: leftContext,
+                requestID: reqID
+            ) { data in
+                guard resumed.trySet() else { return }
+                guard let data,
+                      let decoded = try? JSONDecoder().decode(ProofreadReplyPayload.self, from: data)
                 else {
                     continuation.resume(returning: nil)
                     return

@@ -93,6 +93,9 @@ public protocol PinyinEngineProtocol: AnyObject {
 
     /// 无副作用只读探针：查询纠偏拼音对应的 Top-N 候选词（绝不修改当前主会话组合状态）
     func probeCandidates(forPinyin pinyin: String, limit: Int) -> [PinyinCandidate]
+
+    /// 无副作用单字探针：查询单个音节或声母简拼对应的纯净单汉字候选（最多 96 字，用于超长输入逐字选）
+    func probeSingleChars(forSyllable syllable: String, limit: Int) -> [PinyinCandidate]
 }
 
 public extension PinyinEngineProtocol {
@@ -103,6 +106,10 @@ public extension PinyinEngineProtocol {
     func setOption(_ name: String, value: Bool) {}
 
     func probeCandidates(forPinyin pinyin: String, limit: Int) -> [PinyinCandidate] {
+        []
+    }
+
+    func probeSingleChars(forSyllable syllable: String, limit: Int) -> [PinyinCandidate] {
         []
     }
 

@@ -41,16 +41,14 @@ public enum PermissionChecker {
         return AXIsProcessTrustedWithOptions(options)
     }
 
-    /// 兼容旧名：检测指定已安装的 SmartPinyin.app（或当前进程）的真实实时辅助功能状态。
-    /// 通过调用 SmartPinyin.app 主二进制的 --check-accessibility 极速子进程，彻底绕过进程内 TCC 缓存，
-    /// 确保用户在系统设置中勾选 SmartPinyin 后可立即实时刷新。
+    /// 检测指定已安装的 SmartPinyin.app（或当前进程）的真实实时辅助功能状态。
+    /// 通过调用 SmartPinyin.app 主二进制的 --check-accessibility 极速子进程绕过 TCC 缓存；
+    /// 若已传入有效的已安装 SmartPinyin.app，直接返回其真实状态，绝不回落检测 Setup App 自身避免假阳性绿勾。
     public static func isAccessibilityTrusted(installedAppURL: URL? = nil) -> Bool {
         if let appURL = installedAppURL {
             let exeURL = appURL.appendingPathComponent("Contents/MacOS/SmartPinyin")
             if FileManager.default.isExecutableFile(atPath: exeURL.path) {
-                if runQuickProbe(executableURL: exeURL, arguments: ["--check-accessibility"]) == 0 {
-                    return true
-                }
+                return runQuickProbe(executableURL: exeURL, arguments: ["--check-accessibility"]) == 0
             }
         }
         return isCurrentProcessAccessibilityTrusted()

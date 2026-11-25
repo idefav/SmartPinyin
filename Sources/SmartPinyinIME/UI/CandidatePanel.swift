@@ -16,6 +16,7 @@ public final class CandidatePanelController {
 
     private let headerRow = NSStackView()
     private let preeditLabel = NSTextField(labelWithString: "")
+    private let singleCharButton = PillButton()
     private let modeBadgeButton = PillButton()
 
     private let candidatesRow = NSStackView()
@@ -32,6 +33,19 @@ public final class CandidatePanelController {
     private let commitTranslationButton = PillButton()
     private let translationTextLabel = NSTextField(wrappingLabelWithString: "")
 
+    // 独立圆角「整句暂存与校对」卡片（与翻译栏视觉同源，采用翠青色系一眼区分）
+    private let draftCard = ClickableContainerView()
+    private let draftCardStack = NSStackView()
+    private let draftBarTopRow = NSStackView()
+    private let draftTitleBadge = PillButton()
+    private let draftScopeButton = PillButton()
+    private let draftStatusLabel = NSTextField(labelWithString: "")
+    private let draftMetaLabel = NSTextField(labelWithString: "")
+    private let draftCommitOriginalButton = PillButton()
+    private let draftCommitPrimaryButton = PillButton()
+    private let draftTextLabel = NSTextField(wrappingLabelWithString: "")
+    private let draftDiffNoteLabel = NSTextField(labelWithString: "")
+
     // 1–6 语种直选胶囊条（双击右 Option 或点击 [中→EN ▾] 原地展开）
     private let languagePickerRow = NSStackView()
 
@@ -40,6 +54,8 @@ public final class CandidatePanelController {
     private var headerWidthConstraint: NSLayoutConstraint?
     private var candidatesWidthConstraint: NSLayoutConstraint?
     private var translationWidthConstraint: NSLayoutConstraint?
+    private var draftWidthConstraint: NSLayoutConstraint?
+    private var draftMinWidthConstraint: NSLayoutConstraint?
     private var languagePickerWidthConstraint: NSLayoutConstraint?
     private var predictionWidthConstraint: NSLayoutConstraint?
 
@@ -54,6 +70,10 @@ public final class CandidatePanelController {
     public var onCycleTargetLanguage: (() -> Void)?
     public var onCommitTranslation: (() -> Void)?
     public var onCommitOriginalChinese: (() -> Void)?
+    public var onToggleSingleCharMode: (() -> Void)?
+    public var onToggleGlobalDraftScope: (() -> Void)?
+    public var onCommitDraftProofread: (() -> Void)?
+    public var onCommitDraftOriginal: (() -> Void)?
     public var onSelectPrediction: ((Int) -> Void)?
     public var onClosePanel: (() -> Void)?
 
@@ -61,6 +81,7 @@ public final class CandidatePanelController {
         didSet {
             preeditLabel.font = NSFont.monospacedSystemFont(ofSize: max(11, candidateFontSize - 2), weight: .medium)
             translationTextLabel.font = NSFont.systemFont(ofSize: max(13, candidateFontSize - 1), weight: .medium)
+            draftTextLabel.font = NSFont.systemFont(ofSize: max(13, candidateFontSize - 1), weight: .medium)
         }
     }
     public var showSourceBadges: Bool = true
@@ -74,6 +95,7 @@ public final class CandidatePanelController {
             && currentSnapshot.candidates.isEmpty
             && currentSnapshot.preedit.isEmpty
             && !currentSnapshot.showTranslationBar
+            && !currentSnapshot.showDraftBar
             && !currentSnapshot.showLanguagePicker
             && !currentSnapshot.predictions.isEmpty
     }
@@ -125,6 +147,12 @@ public final class CandidatePanelController {
         preeditLabel.usesSingleLineMode = true
         preeditLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        singleCharButton.toolTip = "点击一键切换单字逐选 / 词组模式（拼写时可按 ⌥C）"
+        singleCharButton.onTap = {
+            CandidatePanelController.shared.onToggleSingleCharMode?()
+        }
+        singleCharButton.isHidden = true
+
         modeBadgeButton.toolTip = "点击一键开关实时翻译（拼写时可按 Tab）"
         modeBadgeButton.onTap = {
             CandidatePanelController.shared.onToggleTranslateMode?()
@@ -135,6 +163,7 @@ public final class CandidatePanelController {
 
         headerRow.addArrangedSubview(preeditLabel)
         headerRow.addArrangedSubview(headerSpacer)
+        headerRow.addArrangedSubview(singleCharButton)
         headerRow.addArrangedSubview(modeBadgeButton)
 
         // 2. 候选词行
@@ -227,6 +256,92 @@ public final class CandidatePanelController {
             translationTextLabel.widthAnchor.constraint(equalTo: translationCardStack.widthAnchor, constant: -18)
         ])
 
+        // 3.2 独立圆角「整句暂存与校对」卡片
+        draftCard.wantsLayer = true
+        draftCard.layer?.cornerRadius = 8
+        draftCard.layer?.borderWidth = 0.75
+        draftCard.onTap = {
+            CandidatePanelController.shared.onCommitDraftProofread?()
+        }
+        draftCard.isHidden = true
+
+        draftCardStack.orientation = .vertical
+        draftCardStack.alignment = .leading
+        draftCardStack.spacing = 5
+        draftCardStack.edgeInsets = NSEdgeInsets(top: 7, left: 9, bottom: 7, right: 9)
+        draftCardStack.translatesAutoresizingMaskIntoConstraints = false
+
+        draftBarTopRow.orientation = .horizontal
+        draftBarTopRow.alignment = .centerY
+        draftBarTopRow.spacing = 6
+
+        draftTitleBadge.onTap = nil
+        draftScopeButton.toolTip = "点击切换「全局暂存校对」与关闭（快捷键 ⌃⌥D）"
+        draftScopeButton.onTap = {
+            CandidatePanelController.shared.onToggleGlobalDraftScope?()
+        }
+
+        draftStatusLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+        draftStatusLabel.textColor = .secondaryLabelColor
+        draftStatusLabel.lineBreakMode = .byTruncatingTail
+        draftStatusLabel.usesSingleLineMode = true
+        draftStatusLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+        draftMetaLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        draftMetaLabel.textColor = .tertiaryLabelColor
+        draftMetaLabel.usesSingleLineMode = true
+        draftMetaLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        draftCommitOriginalButton.toolTip = "忽略纠偏，直接上屏原草稿（⇧⏎ 或 ⌥⏎）"
+        draftCommitOriginalButton.onTap = {
+            CandidatePanelController.shared.onCommitDraftOriginal?()
+        }
+
+        draftCommitPrimaryButton.toolTip = "一次性上屏整句 / 纠偏整句（␣ / ⏎）"
+        draftCommitPrimaryButton.onTap = {
+            CandidatePanelController.shared.onCommitDraftProofread?()
+        }
+
+        let draftHeaderSpacer = NSView()
+        draftHeaderSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        draftHeaderSpacer.widthAnchor.constraint(greaterThanOrEqualToConstant: 6).isActive = true
+
+        draftBarTopRow.addArrangedSubview(draftTitleBadge)
+        draftBarTopRow.addArrangedSubview(draftScopeButton)
+        draftBarTopRow.addArrangedSubview(draftStatusLabel)
+        draftBarTopRow.addArrangedSubview(draftHeaderSpacer)
+        draftBarTopRow.addArrangedSubview(draftMetaLabel)
+        draftBarTopRow.addArrangedSubview(draftCommitOriginalButton)
+        draftBarTopRow.addArrangedSubview(draftCommitPrimaryButton)
+
+        draftTextLabel.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        draftTextLabel.textColor = .labelColor
+        draftTextLabel.alignment = .left
+        draftTextLabel.maximumNumberOfLines = 4
+        draftTextLabel.preferredMaxLayoutWidth = 580
+        draftTextLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+        draftDiffNoteLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        draftDiffNoteLabel.textColor = .secondaryLabelColor
+        draftDiffNoteLabel.lineBreakMode = .byTruncatingMiddle
+        draftDiffNoteLabel.usesSingleLineMode = true
+        draftDiffNoteLabel.isHidden = true
+
+        draftCardStack.addArrangedSubview(draftBarTopRow)
+        draftCardStack.addArrangedSubview(draftTextLabel)
+        draftCardStack.addArrangedSubview(draftDiffNoteLabel)
+
+        draftCard.addSubview(draftCardStack)
+        NSLayoutConstraint.activate([
+            draftCardStack.topAnchor.constraint(equalTo: draftCard.topAnchor),
+            draftCardStack.bottomAnchor.constraint(equalTo: draftCard.bottomAnchor),
+            draftCardStack.leadingAnchor.constraint(equalTo: draftCard.leadingAnchor),
+            draftCardStack.trailingAnchor.constraint(equalTo: draftCard.trailingAnchor),
+            draftBarTopRow.widthAnchor.constraint(equalTo: draftCardStack.widthAnchor, constant: -18),
+            draftTextLabel.widthAnchor.constraint(equalTo: draftCardStack.widthAnchor, constant: -18),
+            draftDiffNoteLabel.widthAnchor.constraint(equalTo: draftCardStack.widthAnchor, constant: -18)
+        ])
+
         // 3.5 1–6 语种直选胶囊条
         languagePickerRow.orientation = .horizontal
         languagePickerRow.alignment = .centerY
@@ -240,6 +355,7 @@ public final class CandidatePanelController {
         root.addArrangedSubview(headerRow)
         root.addArrangedSubview(candidatesRow)
         root.addArrangedSubview(translationCard)
+        root.addArrangedSubview(draftCard)
         root.addArrangedSubview(languagePickerRow)
         root.addArrangedSubview(predictionRow)
 
@@ -254,6 +370,8 @@ public final class CandidatePanelController {
         headerWidthConstraint = headerRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -22)
         candidatesWidthConstraint = candidatesRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -22)
         translationWidthConstraint = translationCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -22)
+        draftWidthConstraint = draftCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -22)
+        draftMinWidthConstraint = draftCard.widthAnchor.constraint(greaterThanOrEqualToConstant: 410)
         languagePickerWidthConstraint = languagePickerRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -22)
         predictionWidthConstraint = predictionRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -22)
 
@@ -314,13 +432,69 @@ public final class CandidatePanelController {
         let isPredictionOnly = snap.candidates.isEmpty
             && snap.preedit.isEmpty
             && !snap.showTranslationBar
+            && !snap.showDraftBar
             && !snap.predictions.isEmpty
 
         // 1. 顶部行
         headerRow.isHidden = isPredictionOnly
         if !isPredictionOnly {
-            preeditLabel.stringValue = snap.preedit
-            preeditLabel.isHidden = snap.preedit.isEmpty
+            let showDraftOnly = snap.showDraftBar && !snap.showTranslationBar && snap.translationPreview == .hidden
+            if showDraftOnly && !snap.isSingleCharMode && !snap.draftSourcePreview.isEmpty {
+                let committedPrefix = String(snap.draftSourcePreview.prefix(max(0, min(snap.draftCommittedLength, snap.draftSourcePreview.count))))
+                if !committedPrefix.isEmpty && snap.preedit == committedPrefix {
+                    // 整句暂存待续拼态：底栏卡片已完整展示草稿及纠偏高亮，顶部显示轻量提示，避免上下重复展示未纠偏原文
+                    preeditLabel.stringValue = snap.draftSpaceCommitsDraft
+                        ? "续拼拼音 · ␣ 上屏 · ⌫ 删字 · ⌥⌫ 删段"
+                        : "续拼拼音 · ⌫ 删字 · ⌥⌫ 删段"
+                    preeditLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+                    preeditLabel.textColor = .secondaryLabelColor
+                    preeditLabel.isHidden = false
+                } else {
+                    let activePart: String
+                    if !committedPrefix.isEmpty && snap.preedit.hasPrefix(committedPrefix) {
+                        activePart = String(snap.preedit.dropFirst(committedPrefix.count))
+                            .trimmingCharacters(in: .whitespaces)
+                    } else {
+                        activePart = snap.preedit
+                    }
+                    preeditLabel.stringValue = activePart
+                    preeditLabel.font = NSFont.monospacedSystemFont(ofSize: max(11, candidateFontSize - 2), weight: .medium)
+                    preeditLabel.textColor = .labelColor
+                    preeditLabel.isHidden = activePart.isEmpty
+                }
+            } else {
+                preeditLabel.stringValue = snap.preedit
+                preeditLabel.font = NSFont.monospacedSystemFont(ofSize: max(11, candidateFontSize - 2), weight: .medium)
+                preeditLabel.textColor = .labelColor
+                preeditLabel.isHidden = snap.preedit.isEmpty
+            }
+            if snap.isSingleCharMode {
+                singleCharButton.isHidden = false
+                singleCharButton.configure(
+                    title: "单字 · 回词组",
+                    textColor: .white,
+                    fillColor: NSColor.systemIndigo.withAlphaComponent(0.88),
+                    font: .systemFont(ofSize: 10, weight: .semibold),
+                    horizontalPad: 6,
+                    verticalPad: 2
+                )
+                singleCharButton.toolTip = snap.singleCharProgressHint.isEmpty
+                    ? "单字逐选模式 · ⇧←/→ 调音节边界 · ⌥C 切回词组"
+                    : snap.singleCharProgressHint
+            } else if snap.canToggleSingleCharMode {
+                singleCharButton.isHidden = false
+                singleCharButton.configure(
+                    title: "单字",
+                    textColor: .secondaryLabelColor,
+                    fillColor: NSColor.secondaryLabelColor.withAlphaComponent(0.14),
+                    font: .systemFont(ofSize: 10, weight: .medium),
+                    horizontalPad: 5,
+                    verticalPad: 2
+                )
+                singleCharButton.toolTip = "点击或按 ⌥C 进入单字逐选模式（长句找不到词时可逐字挑）"
+            } else {
+                singleCharButton.isHidden = true
+            }
             configureModeBadge(
                 snap.mode,
                 isCodingMode: snap.isCodingModeActive,
@@ -456,6 +630,13 @@ public final class CandidatePanelController {
             }
         }
 
+        // 3.2 独立「整句暂存与校对」卡片（与翻译栏互斥，采用翠青色系视觉区分）
+        let shouldShowDraft = !shouldShowBar && snap.showDraftBar
+        draftCard.isHidden = !shouldShowDraft
+        if shouldShowDraft {
+            applyDraftCard(snapshot: snap)
+        }
+
         // 3.5 1–6 语种直选胶囊条（双击右 Option 或点击 [中→EN ▾] 展开，1 次点击或按 1–6 直达）
         languagePickerRow.arrangedSubviews.forEach { view in
             languagePickerRow.removeArrangedSubview(view)
@@ -562,8 +743,234 @@ public final class CandidatePanelController {
         headerWidthConstraint?.isActive = !headerRow.isHidden
         candidatesWidthConstraint?.isActive = !candidatesRow.isHidden
         translationWidthConstraint?.isActive = !translationCard.isHidden
+        draftWidthConstraint?.isActive = !draftCard.isHidden
+        draftMinWidthConstraint?.isActive = !draftCard.isHidden
         languagePickerWidthConstraint?.isActive = !languagePickerRow.isHidden
         predictionWidthConstraint?.isActive = !predictionRow.isHidden
+    }
+
+    private func applyDraftCard(snapshot snap: CandidatePanelSnapshot) {
+        let tealAccent = NSColor.systemTeal
+        draftCard.layer?.backgroundColor = tealAccent.withAlphaComponent(0.085).cgColor
+        draftCard.layer?.borderColor = tealAccent.withAlphaComponent(0.28).cgColor
+
+        draftTitleBadge.configure(
+            title: "整句校对",
+            textColor: Self.draftAccentTextColor,
+            fillColor: tealAccent.withAlphaComponent(0.18),
+            font: .systemFont(ofSize: 10.5, weight: .semibold),
+            horizontalPad: 6,
+            verticalPad: 2
+        )
+
+        if snap.isGlobalDraftMode {
+            draftScopeButton.configure(
+                title: "全局",
+                textColor: .white,
+                fillColor: tealAccent.withAlphaComponent(0.86),
+                font: .systemFont(ofSize: 9.5, weight: .semibold),
+                horizontalPad: 5,
+                verticalPad: 2
+            )
+            draftScopeButton.toolTip = "整句暂存校对已全局开启 · 点击或按 ⌃⌥D 关闭"
+        } else {
+            draftScopeButton.configure(
+                title: "本句",
+                textColor: .secondaryLabelColor,
+                fillColor: NSColor.secondaryLabelColor.withAlphaComponent(0.14),
+                font: .systemFont(ofSize: 9.5, weight: .medium),
+                horizontalPad: 5,
+                verticalPad: 2
+            )
+            draftScopeButton.toolTip = "点击锁定为全局整句暂存校对模式"
+        }
+
+        let src = snap.draftSourcePreview
+        let baseFont = NSFont.systemFont(ofSize: max(13, candidateFontSize - 1), weight: .medium)
+        let isComposingSegment = !snap.candidates.isEmpty
+        let commitPrefix: String
+        if !snap.draftSpaceCommitsDraft {
+            commitPrefix = "⏎ "
+            draftCommitPrimaryButton.toolTip = "一次性上屏整句 / 纠偏整句（⏎）"
+        } else if isComposingSegment {
+            commitPrefix = ""
+            draftCommitPrimaryButton.toolTip = "点击立即上屏，或按空格进草稿后再按空格上屏"
+        } else {
+            commitPrefix = "␣ "
+            draftCommitPrimaryButton.toolTip = "再次按空格立即上屏整句 / 纠偏整句（␣ / ⏎）"
+        }
+        draftDiffNoteLabel.isHidden = true
+        draftDiffNoteLabel.stringValue = ""
+
+        switch snap.draftProofreadState {
+        case .suggested(let suggestedSource, let corrected, let segments, let changeCount, let latencyMs, let backendLabel) where suggestedSource == src:
+            draftStatusLabel.stringValue = "已纠偏 \(changeCount) 处"
+            draftStatusLabel.textColor = Self.draftAccentTextColor
+            draftMetaLabel.stringValue = latencyMs < 1.0 ? backendLabel : "\(backendLabel) \(String(format: "%.0fms", latencyMs))"
+            draftMetaLabel.isHidden = false
+
+            let attributed = NSMutableAttributedString()
+            var diffSummaryParts: [String] = []
+            for seg in segments {
+                if seg.isChanged {
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: NSFont.systemFont(ofSize: max(13, candidateFontSize - 1), weight: .bold),
+                        .foregroundColor: Self.draftAccentTextColor,
+                        .backgroundColor: tealAccent.withAlphaComponent(0.20),
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ]
+                    attributed.append(NSAttributedString(string: seg.text, attributes: attrs))
+                    if let orig = seg.originalText, !orig.isEmpty {
+                        diffSummaryParts.append("\(orig)→\(seg.text)")
+                    }
+                } else {
+                    attributed.append(NSAttributedString(
+                        string: seg.text,
+                        attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor]
+                    ))
+                }
+            }
+            if attributed.length > 0 {
+                draftTextLabel.attributedStringValue = attributed
+            } else {
+                draftTextLabel.attributedStringValue = NSAttributedString(
+                    string: corrected,
+                    attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor]
+                )
+            }
+            if !diffSummaryParts.isEmpty {
+                draftDiffNoteLabel.stringValue = "修正对比：" + diffSummaryParts.prefix(5).joined(separator: "  ·  ")
+                draftDiffNoteLabel.isHidden = false
+            }
+
+            draftCommitOriginalButton.configure(
+                title: "⇧⏎ 原文",
+                textColor: .secondaryLabelColor,
+                fillColor: NSColor.secondaryLabelColor.withAlphaComponent(0.14),
+                font: .systemFont(ofSize: 10, weight: .medium),
+                horizontalPad: 5,
+                verticalPad: 2
+            )
+            draftCommitOriginalButton.isHidden = false
+
+            draftCommitPrimaryButton.configure(
+                title: "\(commitPrefix)上屏纠偏",
+                textColor: .white,
+                fillColor: tealAccent,
+                font: .systemFont(ofSize: 10, weight: .semibold),
+                horizontalPad: 6,
+                verticalPad: 2
+            )
+            draftCommitPrimaryButton.isHidden = false
+
+        case .checking:
+            draftStatusLabel.stringValue = "⋯ 校对中（\(src.count)字）"
+            draftStatusLabel.textColor = .secondaryLabelColor
+            draftMetaLabel.stringValue = ""
+            draftMetaLabel.isHidden = true
+            renderRawDraftPreview(src: src, committedLen: snap.draftCommittedLength, baseFont: baseFont)
+            draftCommitOriginalButton.isHidden = true
+            draftCommitPrimaryButton.configure(
+                title: "\(commitPrefix)上屏整句",
+                textColor: .white,
+                fillColor: tealAccent,
+                font: .systemFont(ofSize: 10, weight: .semibold),
+                horizontalPad: 6,
+                verticalPad: 2
+            )
+            draftCommitPrimaryButton.isHidden = src.isEmpty
+
+        case .clean(_, let latencyMs, let backendLabel):
+            draftStatusLabel.stringValue = "✓ 校对无误（\(src.count)字）"
+            draftStatusLabel.textColor = .secondaryLabelColor
+            draftMetaLabel.stringValue = latencyMs < 1.0 ? backendLabel : "\(backendLabel) \(String(format: "%.0fms", latencyMs))"
+            draftMetaLabel.isHidden = false
+            renderRawDraftPreview(src: src, committedLen: snap.draftCommittedLength, baseFont: baseFont)
+            draftCommitOriginalButton.isHidden = true
+            draftCommitPrimaryButton.configure(
+                title: "\(commitPrefix)上屏整句",
+                textColor: .white,
+                fillColor: tealAccent,
+                font: .systemFont(ofSize: 10, weight: .semibold),
+                horizontalPad: 6,
+                verticalPad: 2
+            )
+            draftCommitPrimaryButton.isHidden = src.isEmpty
+
+        case .idle, .unavailable, .suggested:
+            let hasHanzi = src.unicodeScalars.contains {
+                (0x4E00...0x9FFF).contains($0.value) || (0x3400...0x4DBF).contains($0.value)
+            }
+            if src.isEmpty {
+                draftStatusLabel.stringValue = snap.draftSpaceCommitsDraft
+                    ? "␣ 选词进草稿 · 再按 ␣ 上屏"
+                    : "␣ 选词拼句 · ⏎ 整体上屏"
+            } else if !hasHanzi {
+                draftStatusLabel.stringValue = "英文（\(src.count)字）· ␣/⏎ 上屏"
+            } else if isComposingSegment {
+                draftStatusLabel.stringValue = "草稿（\(src.count)字）· ␣ 进草稿"
+            } else {
+                draftStatusLabel.stringValue = snap.draftSpaceCommitsDraft
+                    ? "草稿（\(src.count)字）· ␣ 上屏"
+                    : "草稿（\(src.count)字）· ␣ 续拼"
+            }
+            draftStatusLabel.textColor = .secondaryLabelColor
+            draftMetaLabel.stringValue = ""
+            draftMetaLabel.isHidden = true
+            if src.isEmpty {
+                let placeholder = snap.draftSpaceCommitsDraft
+                    ? "按空格选词进入草稿自动校对，确认无误后再按一次空格一次性上屏"
+                    : "在此拼接整段中英文并自动整体错字纠偏，满意后按回车一次性上屏"
+                draftTextLabel.attributedStringValue = NSAttributedString(
+                    string: placeholder,
+                    attributes: [.font: baseFont, .foregroundColor: NSColor.secondaryLabelColor]
+                )
+            } else {
+                renderRawDraftPreview(src: src, committedLen: snap.draftCommittedLength, baseFont: baseFont)
+            }
+            draftCommitOriginalButton.isHidden = true
+            draftCommitPrimaryButton.configure(
+                title: "\(commitPrefix)上屏整句",
+                textColor: .white,
+                fillColor: tealAccent,
+                font: .systemFont(ofSize: 10, weight: .semibold),
+                horizontalPad: 6,
+                verticalPad: 2
+            )
+            draftCommitPrimaryButton.isHidden = src.isEmpty
+        }
+    }
+
+    private func renderRawDraftPreview(src: String, committedLen: Int, baseFont: NSFont) {
+        let clamped = max(0, min(committedLen, src.count))
+        if clamped > 0 && clamped < src.count {
+            let committedPart = String(src.prefix(clamped))
+            let composingPart = String(src.dropFirst(clamped))
+            let attr = NSMutableAttributedString(
+                string: committedPart,
+                attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor]
+            )
+            attr.append(NSAttributedString(
+                string: composingPart,
+                attributes: [
+                    .font: baseFont,
+                    .foregroundColor: Self.draftAccentTextColor.withAlphaComponent(0.88),
+                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                ]
+            ))
+            draftTextLabel.attributedStringValue = attr
+        } else {
+            draftTextLabel.attributedStringValue = NSAttributedString(
+                string: src,
+                attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor]
+            )
+        }
+    }
+
+    private static let draftAccentTextColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedRed: 0.42, green: 0.90, blue: 0.84, alpha: 1.0)
+            : NSColor(calibratedRed: 0.05, green: 0.48, blue: 0.45, alpha: 1.0)
     }
 
     /// 按清晰视觉优先级为每个候选决定最多 1 个微标（绝不双标拥挤）：
@@ -606,6 +1013,11 @@ public final class CandidatePanelController {
 
         guard showSourceBadges else { return nil }
         switch item.source {
+        case .mixedBilingual:
+            let hasHanzi = item.text.unicodeScalars.contains {
+                (0x4E00...0x9FFF).contains($0.value) || (0x3400...0x4DBF).contains($0.value)
+            }
+            return CandidateBadgeDescriptor(text: hasHanzi ? "混" : "英", style: .inlineText(.systemTeal))
         case .documentContext:
             return CandidateBadgeDescriptor(text: "文", style: .inlineText(.systemTeal))
         case .workingMemory:
@@ -675,6 +1087,17 @@ public final class CandidatePanelController {
                 title: title,
                 textColor: .controlAccentColor,
                 fillColor: NSColor.controlAccentColor.withAlphaComponent(0.18),
+                font: .systemFont(ofSize: 10.5, weight: .semibold),
+                horizontalPad: 7,
+                verticalPad: 2
+            )
+        case .draftProofread:
+            modeBadgeButton.isEnabled = true
+            let suffix = !sceneSuffix.isEmpty ? " · \(sceneSuffix)" : (isCodingMode ? " · Code" : "")
+            modeBadgeButton.configure(
+                title: "校\(suffix)",
+                textColor: Self.draftAccentTextColor,
+                fillColor: NSColor.systemTeal.withAlphaComponent(0.20),
                 font: .systemFont(ofSize: 10.5, weight: .semibold),
                 horizontalPad: 7,
                 verticalPad: 2

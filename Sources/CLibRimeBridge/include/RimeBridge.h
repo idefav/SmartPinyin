@@ -76,6 +76,15 @@ SPMRimeCandidate* spm_rime_probe_candidates(
     int32_t* out_count
 );
 
+/// 使用只读探针会话查询单个拼音音节或声母简拼的纯净单汉字候选列表（最多 96 字，支持单字逐选翻页），
+/// 调用方须用 spm_rime_free_candidates 释放返回的数组。
+SPMRimeCandidate* spm_rime_probe_single_chars(
+    SPMRimeEngine* engine,
+    const char* ascii_pinyin,
+    int32_t max_results,
+    int32_t* out_count
+);
+
 void spm_rime_free_candidates(SPMRimeCandidate* candidates, int32_t count);
 
 #ifdef __cplusplus

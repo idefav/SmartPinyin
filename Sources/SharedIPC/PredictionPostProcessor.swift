@@ -105,7 +105,15 @@ public enum PredictionPostProcessor {
         let bodyForChecks = s.hasPrefix("，") ? String(s.dropFirst()) : s
         guard !bodyForChecks.isEmpty else { return nil }
         if !allowSingleChar && bodyForChecks.count < 2 { return nil }
-        if bodyForChecks.count > 10 { return nil }
+        let isCleanEnglishWord = bodyForChecks.unicodeScalars.allSatisfy {
+            ($0.value >= 65 && $0.value <= 90)
+                || ($0.value >= 97 && $0.value <= 122)
+                || ($0.value >= 48 && $0.value <= 57)
+                || $0.value == 95
+                || $0.value == 45
+        } && bodyForChecks.count >= 2
+        let maxLen = isCleanEnglishWord ? 16 : 10
+        if bodyForChecks.count > maxLen { return nil }
         if blockedStandalone.contains(bodyForChecks) { return nil }
         if s.contains("<") || s.contains(">") || s.contains("|") { return nil }
 
@@ -125,18 +133,9 @@ public enum PredictionPostProcessor {
             }
         }
 
-        // 若上文含中文，拒绝纯 ASCII 碎片或包含控制字符的异常输出
-        let leftHasChinese = trimmedLeft.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
-        if leftHasChinese {
-            let hasChinese = bodyForChecks.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
-            let isCleanEnglishIdentifier = bodyForChecks.unicodeScalars.allSatisfy {
-                ($0.value >= 65 && $0.value <= 90)
-                    || ($0.value >= 97 && $0.value <= 122)
-                    || ($0.value >= 48 && $0.value <= 57)
-                    || $0.value == 95
-            } && bodyForChecks.count >= 3
-            guard hasChinese || isCleanEnglishIdentifier else { return nil }
-        }
+        // 过滤含控制字符或纯乱码标点片段（同时放行中文、中英混输与干净英文标识符）
+        let hasChinese = bodyForChecks.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+        guard hasChinese || (isCleanEnglishWord && bodyForChecks.count >= 3) else { return nil }
 
         return s
     }
