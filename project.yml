@@ -1,0 +1,197 @@
+name: SmartPinyin
+options:
+  bundleIdPrefix: com.smartpinyin.inputmethod
+  deploymentTarget:
+    macOS: "15.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    CLANG_CXX_LANGUAGE_STANDARD: c++17
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    GENERATE_INFOPLIST_FILE: YES
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: NO
+
+targets:
+  SharedIPC:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/SharedIPC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.SharedIPC
+        DEFINES_MODULE: YES
+
+  PinyinEngineCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/CLibRimeBridge
+      - path: Sources/PinyinEngineCore
+    dependencies:
+      - target: SharedIPC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.PinyinEngineCore
+        DEFINES_MODULE: YES
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/Vendor/librime/dist/include"
+          - "$(PROJECT_DIR)/Sources/CLibRimeBridge/include"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/Vendor/librime/dist/lib"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-lrime"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "@loader_path/Frameworks"
+          - "$(PROJECT_DIR)/Vendor/librime/dist/lib"
+        SWIFT_INCLUDE_PATHS:
+          - "$(PROJECT_DIR)/Sources/CLibRimeBridge/include"
+
+  SmartPinyinCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/SmartPinyinCore
+    dependencies:
+      - target: SharedIPC
+      - target: PinyinEngineCore
+      - sdk: NaturalLanguage.framework
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.SmartPinyinCore
+        DEFINES_MODULE: YES
+
+  LocalInferenceCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/CLlamaBridge
+      - path: Sources/LocalInferenceCore
+    dependencies:
+      - target: SharedIPC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.LocalInferenceCore
+        DEFINES_MODULE: YES
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "/opt/homebrew/opt/llama.cpp/include"
+          - "/opt/homebrew/opt/ggml/include"
+          - "$(PROJECT_DIR)/Sources/CLlamaBridge/include"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "/opt/homebrew/opt/llama.cpp/lib"
+          - "/opt/homebrew/opt/ggml/lib"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-lllama"
+          - "-lggml"
+          - "-lggml-base"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "@loader_path/Frameworks"
+          - "/opt/homebrew/opt/llama.cpp/lib"
+          - "/opt/homebrew/opt/ggml/lib"
+        SWIFT_INCLUDE_PATHS:
+          - "$(PROJECT_DIR)/Sources/CLlamaBridge/include"
+
+  SmartPinyinInference:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - path: Sources/SmartPinyinInference
+        excludes:
+          - Info.plist
+    dependencies:
+      - target: SharedIPC
+      - target: LocalInferenceCore
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/SmartPinyinInference/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.SmartPinyin.InferenceService
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "@executable_path/../../../../Frameworks"
+          - "/opt/homebrew/opt/llama.cpp/lib"
+          - "/opt/homebrew/opt/ggml/lib"
+
+  SmartPinyin:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/SmartPinyinIME
+        excludes:
+          - Info.plist
+    dependencies:
+      - target: SharedIPC
+      - target: PinyinEngineCore
+      - target: SmartPinyinCore
+      - target: LocalInferenceCore
+        link: false
+        embed: true
+      - target: SmartPinyinInference
+        embed: true
+      - sdk: InputMethodKit.framework
+      - sdk: Carbon.framework
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/SmartPinyinIME/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.SmartPinyin
+        PRODUCT_NAME: SmartPinyin
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+          - "$(PROJECT_DIR)/Vendor/librime/dist/lib"
+
+  SmartPinyinInstallerCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/SmartPinyinInstallerCore
+    dependencies:
+      - target: SharedIPC
+      - sdk: Carbon.framework
+      - sdk: ApplicationServices.framework
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.SmartPinyinInstallerCore
+        DEFINES_MODULE: YES
+
+  SmartPinyinSetup:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/SmartPinyinSetup
+        excludes:
+          - Info.plist
+    dependencies:
+      - target: SharedIPC
+      - target: SmartPinyinInstallerCore
+      - sdk: Carbon.framework
+      - sdk: ApplicationServices.framework
+    settings:
+      base:
+        INFOPLIST_FILE: Sources/SmartPinyinSetup/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.smartpinyin.inputmethod.SmartPinyin.Setup
+        PRODUCT_NAME: SmartPinyinSetup
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"

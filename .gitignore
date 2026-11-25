@@ -1,0 +1,25 @@
+# macOS & IDE
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+
+# SwiftPM & Xcode build artifacts
+.build/
+.swiftpm/
+build/
+dist/
+SmartPinyin.xcodeproj/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Large upstream binaries, Rime datasets & local GGUF models
+# Run `bash Scripts/fetch-deps.sh` (or `--with-models`) to fetch these automatically.
+Vendor/librime/
+Resources/RimeData/
+Models/

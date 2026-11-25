@@ -1,0 +1,4 @@
+module CLlamaBridge {
+    header "LlamaBridge.h"
+    export *
+}

@@ -1,0 +1,4 @@
+module CLibRimeBridge {
+    header "RimeBridge.h"
+    export *
+}

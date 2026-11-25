@@ -1,0 +1,25 @@
+SmartPinyin Bundled Lexicon Tag Index — Third-Party Attribution
+===============================================================
+
+1. chinese-xinhua (data/idiom.json)
+   Source: https://github.com/pwxcoo/chinese-xinhua
+   License: MIT License
+
+2. THUOCL (THU Open Chinese Lexicon: chengyu, poem, IT, medical, law, caijing, animal)
+   Source: https://github.com/thunlp/THUOCL
+   License: MIT License
+   Citation: 使用了清华大学开放中文词库 (THUOCL)
+
+3. chinese-poetry (tangshisanbaishou, songci300, qianjiashi, shijing)
+   Source: https://github.com/chinese-poetry/chinese-poetry
+   License: MIT License
+
+4. rime-wanxiang-data (huaxue terminology subset)
+   Source: https://github.com/amzxyz/rime-wanxiang-data
+   License: Creative Commons Attribution 4.0 International (CC-BY-4.0)
+
+Build Summary
+-------------
+- Literary idioms:  31180
+- Literary poetry:  25648
+- Domain terms:     50851

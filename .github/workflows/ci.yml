@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-macos-arm64:
+    name: Build & Test (macOS 15 Apple Silicon)
+    runs-on: macos-15
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew install xcodegen llama.cpp libomp
+          brew list ggml >/dev/null 2>&1 || brew install ggml || true
+
+      - name: Cache librime & Wanxiang RimeData
+        uses: actions/cache@v4
+        with:
+          path: |
+            Vendor/librime
+            Resources/RimeData
+          key: smartpinyin-deps-librime1.17.0-wanxiang18.2.1-lts
+
+      - name: Fetch external Rime & Wanxiang dependencies
+        run: bash Scripts/fetch-deps.sh
+
+      - name: Lint packaging & installer shell scripts
+        run: |
+          bash -n Scripts/fetch-deps.sh
+          bash -n Scripts/package-installer.sh
+          bash -n Scripts/build-and-install.sh
+          sh -n Scripts/pkg/postinstall
+
+      - name: Run Swift unit tests
+        run: swift test

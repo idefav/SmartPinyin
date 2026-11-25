@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmartPinyin — 为 Apple Silicon 而生的 macOS 原生智能拼音输入法</title>
+  <meta name="description" content="SmartPinyin：基于 InputMethodKit、librime 万象词库与本地 Metal 小模型的 macOS 原生智能输入法。快打纠错、诗词成语标识、0ms 智能场景词库、语境联想与离线翻译，严格 < 2GB 内存，100% 离线隐私。" />
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- 顶部滚动进度条 -->
+  <div class="scroll-progress-track" aria-hidden="true">
+    <div class="scroll-progress-bar" id="scrollProgressBar"></div>
+  </div>
+
+  <!-- 动态环境光晕层（随滚动视差漂移） -->
+  <div class="ambient-layer" aria-hidden="true">
+    <div class="ambient-orb orb-1" id="orb1"></div>
+    <div class="ambient-orb orb-2" id="orb2"></div>
+    <div class="ambient-orb orb-3" id="orb3"></div>
+    <div class="ambient-grid"></div>
+  </div>
+
+  <!-- 顶部悬浮毛玻璃导航 -->
+  <header class="navbar" id="navbar">
+    <div class="container nav-inner">
+      <a class="brand" href="#top" aria-label="SmartPinyin 首页">
+        <img src="./favicon.svg" alt="" class="brand-icon" width="32" height="32" />
+        <span class="brand-name">SmartPinyin</span>
+        <span class="brand-pill">macOS 15+</span>
+      </a>
+      <nav class="nav-links" aria-label="主导航">
+        <a href="#showcase">滚动演示</a>
+        <a href="#metrics">性能实测</a>
+        <a href="#shortcuts">快捷键</a>
+        <a href="#download">下载与协议</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="icon-btn" id="themeToggle" type="button" aria-label="切换深浅色主题" title="切换深浅色主题">
+          <span class="theme-icon" id="themeIcon">☀</span>
+        </button>
+        <a class="btn btn-ghost" href="https://github.com/idefav/SmartPinyin" target="_blank" rel="noopener">GitHub</a>
+        <a class="btn btn-primary" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">下载</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- ==================== HERO ==================== -->
+    <section class="hero">
+      <div class="container hero-grid">
+        <div class="hero-copy" data-reveal>
+          <div class="hero-eyebrow">
+            <span class="pulse-dot"></span>
+            <span>Apple Silicon 原生 · 100% 离线端侧智能 · 个人免费开源</span>
+          </div>
+          <h1 class="hero-title">
+            <span class="gradient-text">快如闪电</span>的拼音底座，<br />
+            懂语境的<span class="gradient-text-alt">端侧大脑</span>。
+          </h1>
+          <p class="hero-subtitle">
+            融合 <code>librime 1.17</code> 万象语法模型与独立 XPC 进程 Metal 本地小模型：
+            <code>0.61 ms</code> 极速响应、三级快打纠错、诗词成语微胶囊、0ms 八大场景智能词库与离线多语种翻译——全程峰值内存严格低于 <strong>2 GB</strong>。
+          </p>
+          <div class="hero-cta">
+            <a class="btn btn-primary btn-lg" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">
+              <span>下载 macOS 安装包</span>
+              <span class="btn-arrow">→</span>
+            </a>
+            <a class="btn btn-secondary btn-lg" href="#showcase">
+              <span>向下滚动体验动画</span>
+              <span class="btn-arrow">↓</span>
+            </a>
+          </div>
+          <div class="hero-badges">
+            <div class="mini-stat"><strong>0.61 ms</strong><span>L1 拼音 P50</span></div>
+            <div class="mini-stat"><strong>33.4 MB</strong><span>IMK 宿主常驻</span></div>
+            <div class="mini-stat"><strong>56,828</strong><span>诗词与成语索引</span></div>
+            <div class="mini-stat"><strong>0 云端</strong><span>密码框硬阻断</span></div>
+          </div>
+        </div>
+
+        <!-- Hero 实时动画打字窗口 -->
+        <div class="hero-stage-wrap" id="heroParallax">
+          <div class="mac-window hero-window">
+            <div class="mac-titlebar">
+              <div class="mac-dots">
+                <span class="dot red"></span>
+                <span class="dot yellow"></span>
+                <span class="dot green"></span>
+              </div>
+              <div class="mac-title">Notes — SmartPinyin 实时输入演示</div>
+              <div class="mac-ime-pill" id="heroMenuBadge">
+                <span class="ime-glyph">智</span>
+                <span id="heroModeLabel">中文</span>
+              </div>
+            </div>
+            <div class="mac-editor hero-editor">
+              <div class="editor-line-meta">
+                <span class="meta-tag" id="heroDemoTag">演示 1/4 · 快打自动纠错</span>
+                <span class="meta-latency" id="heroLatency">L1 0.58 ms</span>
+              </div>
+              <div class="editor-content">
+                <span id="heroCommitted"></span><span class="preedit-underline" id="heroPreedit"></span><span class="caret"></span>
+              </div>
+
+              <!-- 悬浮毛玻璃候选窗 -->
+              <div class="ime-hud" id="heroHud">
+                <div class="hud-top">
+                  <span class="hud-pinyin" id="heroHudPinyin">s hai g hai</span>
+                  <span class="scene-chip" id="heroSceneChip">拼 · 通用</span>
+                </div>
+                <div class="hud-candidates" id="heroCandidates"></div>
+                <div class="hud-translate-row hidden" id="heroTranslateRow">
+                  <span class="trans-lang-pill" id="heroTransLang">EN</span>
+                  <span class="trans-preview-text" id="heroTransText"></span>
+                </div>
+              </div>
+
+              <!-- 句末联想续写胶囊条 -->
+              <div class="predict-strip hidden" id="heroPredictStrip">
+                <span class="predict-label">联想</span>
+                <div class="predict-items" id="heroPredictItems"></div>
+              </div>
+            </div>
+            <div class="hero-demo-dots" id="heroDemoDots" aria-label="演示切换">
+              <button type="button" class="demo-dot active" data-demo="0">快打纠错</button>
+              <button type="button" class="demo-dot" data-demo="1">诗词标识</button>
+              <button type="button" class="demo-dot" data-demo="2">语境联想</button>
+              <button type="button" class="demo-dot" data-demo="3">离线翻译</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="scroll-cue" aria-hidden="true">
+        <span>向下滚动触发五大交互演示</span>
+        <div class="scroll-mouse"><div class="scroll-wheel"></div></div>
+      </div>
+    </section>
+
+    <!-- ==================== STICKY SCROLLYTELLING SHOWCASE ==================== -->
+    <section class="showcase-section" id="showcase">
+      <div class="container">
+        <div class="section-header" data-reveal>
+          <span class="section-kicker">INTERACTIVE SCROLL TOUR</span>
+          <h2>向下滚动，逐帧见证每一个毫秒级巧思</h2>
+          <p>页面滚动到不同章节时，右侧 macOS 原生悬浮窗会自动触发对应功能的实时动画演示；也可以直接点击按钮亲手切换场景。</p>
+        </div>
+
+        <div class="scrolly-layout">
+          <!-- 左侧 5 个滚动叙事章节 -->
+          <div class="scrolly-steps">
+            <article class="story-step active" data-step="0" tabindex="0">
+              <div class="step-rail"><span class="step-index">01</span><div class="step-line"><div class="step-line-fill"></div></div></div>
+              <div class="step-body">
+                <span class="step-tag tag-amber">三级自动纠错 · 可配置模糊音</span>
+                <h3>打太快敲错字母？<br />影子探针 0.6ms 自动纠偏</h3>
+                <p>
+                  不再为错键、漏键、连键或前后鼻音混淆（<code>an↔ang / en↔eng / in↔ing</code>）停顿退格。
+                  基于惰性只读 <code>probe_session_id</code> 与音节密度过滤，错拼直接置顶并标注 <code>纠</code> 徽章；选词后自动按正确拼音写入用户记忆，绝不污染词库。
+                </p>
+                <div class="step-controls" data-control="typo">
+                  <button type="button" class="chip-btn active" data-typo="shaighai">shaighai → 上海</button>
+                  <button type="button" class="chip-btn" data-typo="shanhai">shanhai → 山海 / 上海</button>
+                  <button type="button" class="chip-btn" data-typo="beijign">beijign → 北京</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="story-step" data-step="1" tabindex="0">
+              <div class="step-rail"><span class="step-index">02</span><div class="step-line"><div class="step-line-fill"></div></div></div>
+              <div class="step-body">
+                <span class="step-tag tag-indigo">诗词成语标识 · 0ms 智能场景适配</span>
+                <h3>诗成一眼识，<br />写代码打游戏自动换脑</h3>
+                <p>
+                  内置 128-bit 双 FNV-1a 二分索引（<code>0.015 ms/页</code>），精准为 31,180 条成语与 25,648 句古诗词挂上自适应深浅色的 <code>成</code> / <code>诗</code> 微胶囊。
+                  结合前台应用与前文语境，0ms 自动在 <strong>代码、游戏、数学、美术、科学、医学、财经、诗词</strong> 8 大场景间切换并从深层候选池捞出专业术语。
+                </p>
+                <div class="step-controls" data-control="scene">
+                  <button type="button" class="chip-btn active" data-scene="poetry">古诗词</button>
+                  <button type="button" class="chip-btn" data-scene="idiom">成语</button>
+                  <button type="button" class="chip-btn" data-scene="gaming">游戏</button>
+                  <button type="button" class="chip-btn" data-scene="math">数学</button>
+                  <button type="button" class="chip-btn" data-scene="art">美术</button>
+                  <button type="button" class="chip-btn" data-scene="code">计算机</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="story-step" data-step="2" tabindex="0">
+              <div class="step-rail"><span class="step-index">03</span><div class="step-line"><div class="step-line-fill"></div></div></div>
+              <div class="step-body">
+                <span class="step-tag tag-cyan">语境记忆联想 · 中英混输快车道</span>
+                <h3>记住你刚删改的前文，<br />中英代码零切换直出</h3>
+                <p>
+                  工作记忆实时跟踪已上屏片段与退格修改，彻底消除联想重复。上屏后单手按 <code>1 / 2 / 3</code> 或 <code>Tab</code> 即可续写，继续敲首字母 0ms 融入首位。
+                  输入 <code>React</code>、<code>HTTPRequest</code>、<code>user_id</code> 等驼峰/大写/下划线标识符免按 Shift 直出。
+                </p>
+                <div class="step-controls" data-control="context">
+                  <button type="button" class="chip-btn active" data-ctx="predict">语境联想续写</button>
+                  <button type="button" class="chip-btn" data-ctx="mixed">中英混输快车道</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="story-step" data-step="3" tabindex="0">
+              <div class="step-rail"><span class="step-index">04</span><div class="step-line"><div class="step-line-fill"></div></div></div>
+              <div class="step-body">
+                <span class="step-tag tag-violet">双进程 XPC · &lt; 2GB 离线多语种翻译</span>
+                <h3>双击右 Option 切六国语言，<br />互斥内存闸门稳守 2GB 红线</h3>
+                <p>
+                  敲中文、实时看译文、回车直接上屏外语。神经网络推理完全隔离在 <code>SmartPinyinInference.xpc</code> 进程：
+                  日常 <code>Qwen3-0.6B</code> 与翻译 <code>HY-MT1.5-1.8B</code> 互斥懒加载，空闲 180 秒自动释放；即便 XPC 异常也 0ms 无感降级回纯拼音。
+                </p>
+                <div class="step-controls" data-control="translate">
+                  <button type="button" class="chip-btn active" data-lang="EN">EN 英语</button>
+                  <button type="button" class="chip-btn" data-lang="JA">JA 日语</button>
+                  <button type="button" class="chip-btn" data-lang="KO">KO 韩语</button>
+                  <button type="button" class="chip-btn" data-lang="FR">FR 法语</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="story-step" data-step="4" tabindex="0">
+              <div class="step-rail"><span class="step-index">05</span><div class="step-line"><div class="step-line-fill"></div></div></div>
+              <div class="step-body">
+                <span class="step-tag tag-emerald">开源词库热更新 · 6 步零残留自卸载</span>
+                <h3>生态词库随时热更新，<br />来去自由一键彻底清理</h3>
+                <p>
+                  在 <code>SmartPinyin Setup</code>「词库与场景」一键同步万象每日词库、THUOCL 学科词库、萌娘/维基百科或自定义 <code>.dict.yaml</code>，原子部署后后台静默热重载。
+                  覆盖升级就地保留目录 inode 与辅助功能 TCC 权限；卸载时强白名单 6 步零残留自删自身。
+                </p>
+                <div class="step-controls" data-control="lifecycle">
+                  <button type="button" class="chip-btn active" data-life="lexicon">词库热更新中心</button>
+                  <button type="button" class="chip-btn" data-life="uninstall">6 步零残留自卸载</button>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <!-- 右侧粘性固定动画舞台 -->
+          <div class="scrolly-stage-col">
+            <div class="sticky-stage" id="stickyStage">
+              <div class="stage-header">
+                <div class="mac-dots">
+                  <span class="dot red"></span>
+                  <span class="dot yellow"></span>
+                  <span class="dot green"></span>
+                </div>
+                <div class="stage-title" id="stageWindowTitle">SmartPinyin · 三级自动纠错</div>
+                <div class="stage-step-indicator" id="stageStepIndicator">01 / 05</div>
+              </div>
+
+              <!-- 5 个舞台面板（随滚动平滑切换并重置动画） -->
+              <div class="stage-canvas">
+                <!-- Panel 0: Typo Auto-Correction -->
+                <div class="stage-panel active" data-panel="0">
+                  <div class="stage-editor-box">
+                    <div class="stage-app-hint">
+                      <span class="app-pill">Safari · 搜索框</span>
+                      <span class="latency-pill" id="typoLatency">Shadow Probe · 0.61 ms</span>
+                    </div>
+                    <div class="stage-input-line">
+                      <span class="typed-preedit" id="typoTyped"></span><span class="caret"></span>
+                    </div>
+                    <div class="ime-hud stage-hud">
+                      <div class="hud-top">
+                        <span class="hud-pinyin" id="typoSeg">s hai g hai</span>
+                        <span class="scene-chip">拼 · 纠偏已开启</span>
+                      </div>
+                      <div class="hud-candidates" id="typoCandidates"></div>
+                    </div>
+                    <div class="correction-flow" id="typoFlow">
+                      <div class="flow-node">
+                        <span class="flow-label">误触原始串</span>
+                        <code id="typoRawCode">shaighai</code>
+                      </div>
+                      <span class="flow-arrow">→</span>
+                      <div class="flow-node highlight">
+                        <span class="flow-label">纠偏正确拼音</span>
+                        <code id="typoFixedCode">shanghai</code>
+                      </div>
+                      <span class="flow-arrow">→</span>
+                      <div class="flow-node success">
+                        <span class="flow-label">记忆回写</span>
+                        <code id="typoWriteback">上海 (shanghai)</code>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Panel 1: Literary Badges & Scene Adaptation -->
+                <div class="stage-panel" data-panel="1">
+                  <div class="stage-editor-box">
+                    <div class="stage-app-hint">
+                      <span class="app-pill" id="sceneAppPill">备忘录 · 文学创作</span>
+                      <span class="latency-pill">Tag Lookup · 0.015 ms</span>
+                    </div>
+                    <div class="scene-context-bar" id="sceneContextBar">
+                      前文语境：<span>古诗默写，床前明月光，</span>
+                    </div>
+                    <div class="stage-input-line">
+                      <span class="typed-preedit" id="sceneTyped">ch r d w</span><span class="caret"></span>
+                    </div>
+                    <div class="ime-hud stage-hud">
+                      <div class="hud-top">
+                        <span class="hud-pinyin" id="sceneSeg">ch r d w</span>
+                        <span class="scene-chip glowing" id="sceneBadgePill">拼 · 诗词</span>
+                      </div>
+                      <div class="hud-candidates" id="sceneCandidates"></div>
+                    </div>
+                    <div class="domain-meter" id="sceneDomainMeter">
+                      <div class="meter-label"><span>场景置信度 &amp; 候选提权</span><strong id="sceneBoostVal">+1.15 boost</strong></div>
+                      <div class="meter-track"><div class="meter-fill" id="sceneBoostBar"></div></div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Panel 2: Context Prediction & Mixed CN/EN -->
+                <div class="stage-panel" data-panel="2">
+                  <div class="stage-editor-box">
+                    <div class="stage-app-hint">
+                      <span class="app-pill" id="ctxAppPill">微信 · 对话窗口</span>
+                      <span class="latency-pill" id="ctxLatencyPill">Session Memory · 0ms 去重</span>
+                    </div>
+                    <div class="stage-input-line ctx-line">
+                      <span id="ctxCommitted"></span><span class="typed-preedit" id="ctxPreedit"></span><span class="caret"></span>
+                    </div>
+                    <div class="predict-strip stage-predict" id="ctxPredictStrip">
+                      <span class="predict-label">联想</span>
+                      <div class="predict-items" id="ctxPredictItems"></div>
+                    </div>
+                    <div class="mixed-fastlane hidden" id="ctxMixedCard">
+                      <div class="fastlane-row">
+                        <span class="fastlane-badge">免切 Shift</span>
+                        <span class="fastlane-token">React</span>
+                        <span class="fastlane-token">user_id</span>
+                        <span class="fastlane-token">useEffect</span>
+                        <span class="fastlane-token">HTTP/3</span>
+                      </div>
+                      <p class="fastlane-desc">识别大写、驼峰、下划线与代码符号，自动启用英文直出快车道与半角标点。</p>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Panel 3: Offline XPC Translation & <2GB Memory Gate -->
+                <div class="stage-panel" data-panel="3">
+                  <div class="stage-editor-box">
+                    <div class="stage-app-hint">
+                      <span class="app-pill">Slack · 实时翻译上屏</span>
+                      <span class="latency-pill">XPC 进程隔离 · Metal GPU</span>
+                    </div>
+                    <!-- 6 语种直选胶囊条 -->
+                    <div class="lang-picker-strip" id="stageLangStrip">
+                      <span class="lang-hint">右 ⌥ ×2</span>
+                      <span class="lang-pill active" data-lp="EN">1 EN</span>
+                      <span class="lang-pill" data-lp="JA">2 JA</span>
+                      <span class="lang-pill" data-lp="KO">3 KO</span>
+                      <span class="lang-pill" data-lp="FR">4 FR</span>
+                      <span class="lang-pill" data-lp="DE">5 DE</span>
+                      <span class="lang-pill" data-lp="ES">6 ES</span>
+                    </div>
+                    <div class="stage-input-line">
+                      <span class="typed-preedit" id="transZhSource"></span><span class="caret"></span>
+                    </div>
+                    <div class="ime-hud stage-hud">
+                      <div class="hud-top">
+                        <span class="hud-pinyin">jin tian wan shang you kong ma</span>
+                        <span class="scene-chip trans-chip" id="transModeBadge">译 → EN</span>
+                      </div>
+                      <div class="hud-translate-row">
+                        <span class="trans-lang-pill" id="stageTransLang">EN</span>
+                        <span class="trans-preview-text" id="stageTransOutput"></span>
+                      </div>
+                    </div>
+                    <!-- 动态内存闸门可视化 -->
+                    <div class="ram-gate-card">
+                      <div class="ram-gate-head">
+                        <span>双进程内存闸门（上限 2.0 GB）</span>
+                        <strong id="ramTotalLabel">1.45 GB / 2.00 GB</strong>
+                      </div>
+                      <div class="ram-bar-wrap">
+                        <div class="ram-seg seg-host" style="width: 3%" title="IMK Host ~33 MB"></div>
+                        <div class="ram-seg seg-xpc" id="ramXpcBar" style="width: 69%"></div>
+                        <div class="ram-limit-mark" title="2 GB 硬红线"></div>
+                      </div>
+                      <div class="ram-legend">
+                        <span><i class="swatch host"></i>IMK 宿主 33 MB</span>
+                        <span id="ramSlotLabel"><i class="swatch xpc"></i>HY-MT1.5-1.8B（互斥活跃槽）</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Panel 4: Lexicon Manager & Clean Uninstall -->
+                <div class="stage-panel" data-panel="4">
+                  <div class="stage-editor-box">
+                    <div class="stage-app-hint">
+                      <span class="app-pill" id="lifeAppPill">SmartPinyin Setup · 词库与场景</span>
+                      <span class="latency-pill" id="lifeStatusPill">热重载就绪</span>
+                    </div>
+                    <!-- 词库视图 -->
+                    <div class="lexicon-list" id="lifeLexiconView">
+                      <div class="lex-card" data-delay="0">
+                        <div class="lex-info"><strong>万象每日构建核心词库</strong><span>CC-BY-4.0 · 核心高频词表</span></div>
+                        <span class="lex-badge ready">已同步</span>
+                      </div>
+                      <div class="lex-card" data-delay="1">
+                        <div class="lex-info"><strong>THUOCL 计算机 / 医学 / 财经</strong><span>MIT · 本地自动注音 + 领域索引</span></div>
+                        <span class="lex-badge updating">热重载完成</span>
+                      </div>
+                      <div class="lex-card" data-delay="2">
+                        <div class="lex-info"><strong>萌娘百科 &amp; 中文维基百科</strong><span>动态 GitHub Release 拉取</span></div>
+                        <span class="lex-badge ready">已启用</span>
+                      </div>
+                      <div class="lex-card" data-delay="3">
+                        <div class="lex-info"><strong>自定义词表导入 (.dict.yaml / .txt)</strong><span>原子覆盖部署 · 0ms 生效</span></div>
+                        <span class="lex-badge ready">支持拖入</span>
+                      </div>
+                    </div>
+                    <!-- 卸载视图 -->
+                    <div class="uninstall-checklist hidden" id="lifeUninstallView">
+                      <div class="check-item"><span class="chk">✓</span>1. 自动切回系统英文键盘并禁用输入源</div>
+                      <div class="check-item"><span class="chk">✓</span>2. 优雅停止 SmartPinyin 与 XPC 推理服务</div>
+                      <div class="check-item"><span class="chk">✓</span>3. DeletionPathValidator 强白名单路径防穿越校验</div>
+                      <div class="check-item"><span class="chk">✓</span>4. 按勾选独立保留或清除词库 / LexiconPacks / GGUF 模型</div>
+                      <div class="check-item"><span class="chk">✓</span>5. 清理系统偏好与陈旧 IntlDataCache 缓存</div>
+                      <div class="check-item"><span class="chk">✓</span>6. 生成脱离会话一次性脚本安全自删卸载器本体</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== BENCHMARK METRICS ==================== -->
+    <section class="metrics-section" id="metrics">
+      <div class="container">
+        <div class="section-header" data-reveal>
+          <span class="section-kicker">VERIFIED PERFORMANCE</span>
+          <h2>硬核实测数据，拒绝纸面参数</h2>
+          <p>在 Apple Silicon 原生 Release 构建下实测验收，每一步改动均由 76 项自动化单元测试与 Mach-O 零路径泄漏门禁守护。</p>
+        </div>
+
+        <div class="metrics-grid">
+          <div class="metric-card" data-reveal style="--stagger: 0">
+            <div class="metric-value"><span class="counter" data-target="0.61" data-decimals="2">0.00</span><small>ms</small></div>
+            <div class="metric-label">L1 拼音查询 P50 延迟</div>
+            <div class="metric-bar"><span style="--fill: 94%"></span></div>
+            <p class="metric-note">P99 仅 2.84 ms，跟手无卡顿</p>
+          </div>
+          <div class="metric-card" data-reveal style="--stagger: 1">
+            <div class="metric-value"><span class="counter" data-target="0.015" data-decimals="3">0.000</span><small>ms</small></div>
+            <div class="metric-label">诗词 / 领域标签检索</div>
+            <div class="metric-bar"><span style="--fill: 98%"></span></div>
+            <p class="metric-note">128-bit 排序哈希表零拷贝二分</p>
+          </div>
+          <div class="metric-card" data-reveal style="--stagger: 2">
+            <div class="metric-value"><span class="counter" data-target="33.4" data-decimals="1">0.0</span><small>MB</small></div>
+            <div class="metric-label">IMK 宿主进程常驻内存</div>
+            <div class="metric-bar"><span style="--fill: 88%"></span></div>
+            <p class="metric-note">独立 XPC 隔离，峰值严格 &lt; 2 GB</p>
+          </div>
+          <div class="metric-card" data-reveal style="--stagger: 3">
+            <div class="metric-value"><span class="counter" data-target="56828" data-decimals="0">0</span><small>条</small></div>
+            <div class="metric-label">内置诗词 &amp; 成语知识库</div>
+            <div class="metric-bar"><span style="--fill: 92%"></span></div>
+            <p class="metric-note">31,180 成语 + 25,648 古诗词名句</p>
+          </div>
+          <div class="metric-card" data-reveal style="--stagger: 4">
+            <div class="metric-value"><span class="counter" data-target="50851" data-decimals="0">0</span><small>词</small></div>
+            <div class="metric-label">8 大专业场景词库索引</div>
+            <div class="metric-bar"><span style="--fill: 86%"></span></div>
+            <p class="metric-note">位掩码多领域归属，支持热加载扩展</p>
+          </div>
+          <div class="metric-card" data-reveal style="--stagger: 5">
+            <div class="metric-value"><span class="counter" data-target="76" data-decimals="0">0</span><small>/ 76</small></div>
+            <div class="metric-label">自动化单元测试全绿</div>
+            <div class="metric-bar"><span style="--fill: 100%"></span></div>
+            <p class="metric-note">25 个 Mach-O 二进制 0 外部路径泄漏</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== SHORTCUTS MATRIX ==================== -->
+    <section class="shortcuts-section" id="shortcuts">
+      <div class="container">
+        <div class="section-header" data-reveal>
+          <span class="section-kicker">MUSCLE MEMORY</span>
+          <h2>顺手到忘记存在的快捷键设计</h2>
+          <p>高频操作集中在拇指与小指自然落点，减少双手离开主键盘区。</p>
+        </div>
+
+        <div class="shortcuts-grid">
+          <div class="shortcut-card" data-reveal style="--stagger: 0">
+            <div class="keycap-row"><kbd class="keycap wide">⇧ Shift</kbd></div>
+            <h4>短按切换中 / 英文</h4>
+            <p>干脆切换中文拼音与英文直出，长按组合键不误触。</p>
+          </div>
+          <div class="shortcut-card" data-reveal style="--stagger: 1">
+            <div class="keycap-row"><kbd class="keycap">右 ⌥</kbd><span class="key-plus">/</span><kbd class="keycap">×2</kbd></div>
+            <h4>单击开翻译 · 双击选语种</h4>
+            <p>空态 0ms 开关翻译模式；双击弹出 1–6 语种直选胶囊条。</p>
+          </div>
+          <div class="shortcut-card" data-reveal style="--stagger: 2">
+            <div class="keycap-row"><kbd class="keycap">1</kbd><kbd class="keycap">2</kbd><kbd class="keycap">3</kbd><span class="key-plus">/</span><kbd class="keycap">Tab</kbd></div>
+            <h4>单手采纳联想续写</h4>
+            <p>上屏后直接按数字键或 Tab 续写，或继续打拼音首字母 0ms 置顶。</p>
+          </div>
+          <div class="shortcut-card" data-reveal style="--stagger: 3">
+            <div class="keycap-row"><kbd class="keycap">⇧</kbd><span class="key-plus">+</span><kbd class="keycap wide">↩ Return</kbd></div>
+            <h4>单句临时译成英文</h4>
+            <p>无需切换翻译模式，普通中文状态下直接把当前句译成英文上屏。</p>
+          </div>
+          <div class="shortcut-card" data-reveal style="--stagger: 4">
+            <div class="keycap-row"><kbd class="keycap">⌃</kbd><kbd class="keycap">⌥</kbd><kbd class="keycap">T</kbd></div>
+            <h4>全局一键关闭翻译</h4>
+            <p>无论当前是否处于拼写态，随时一键回到纯中文输入。</p>
+          </div>
+          <div class="shortcut-card" data-reveal style="--stagger: 5">
+            <div class="keycap-row"><kbd class="keycap">/ja</kbd><kbd class="keycap">/en</kbd><kbd class="keycap">/code</kbd></div>
+            <h4>行内指令免切菜单</h4>
+            <p>行内临时切换目标语种或中英文代码标点风格。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== DOWNLOAD & LICENSE ==================== -->
+    <section class="download-section" id="download">
+      <div class="container">
+        <div class="section-header" data-reveal>
+          <span class="section-kicker">GET SMARTPINYIN</span>
+          <h2>开箱即用，或按需轻装上阵</h2>
+          <p>仅支持 macOS 15.0+（Apple Silicon M 系列芯片），均通过 GitHub Actions 自动化构建与 SHA-256 校验。</p>
+        </div>
+
+        <div class="download-grid">
+          <div class="dl-card featured" data-reveal style="--stagger: 0">
+            <div class="dl-ribbon">推荐 · 断网开箱即用</div>
+            <h3>离线完整版 (Full Bundle)</h3>
+            <p class="dl-desc">内置 <code>librime</code>、万象核心词库与语法模型，以及 <code>Qwen3-0.6B</code> + <code>HY-MT1.5-1.8B</code> 两枚本地 GGUF 模型。</p>
+            <ul class="dl-list">
+              <li>提供图形向导 <code>.dmg</code> 与标准系统 <code>.pkg</code></li>
+              <li>约 1.8 GB，安装完成即享全部端侧 AI 能力</li>
+              <li>覆盖升级自动保留目录 inode 与辅助功能权限</li>
+            </ul>
+            <a class="btn btn-primary btn-full" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">前往 GitHub Releases 下载完整版 →</a>
+          </div>
+
+          <div class="dl-card" data-reveal style="--stagger: 1">
+            <div class="dl-ribbon subtle">轻量 · 模型按需拉取</div>
+            <h3>轻量按需版 (Lite Bundle)</h3>
+            <p class="dl-desc">内置完整 L1 极速拼音底座、自动纠错与诗词/场景知识库；AI 模型可在安装向导中按需一键拉取或导入。</p>
+            <ul class="dl-list">
+              <li>体积仅约 373 MB，下载飞快</li>
+              <li>内置 ModelScope / HuggingFace 双镜像自动导入</li>
+              <li>同样支持 6 步零残留「卸载自己」</li>
+            </ul>
+            <a class="btn btn-secondary btn-full" href="https://github.com/idefav/SmartPinyin/releases/latest" target="_blank" rel="noopener">前往 GitHub Releases 下载轻量版 →</a>
+          </div>
+        </div>
+
+        <!-- MIT 非商用协议醒目声明 -->
+        <div class="license-banner" data-reveal>
+          <div class="license-icon" aria-hidden="true">⚖</div>
+          <div class="license-content">
+            <h4>MIT Non-Commercial License（仅允许个人非商业使用 · 禁止商用）</h4>
+            <p>
+              SmartPinyin 基于 MIT 协议修订开源：<strong>允许</strong>个人日常使用、学习、研究与保留本声明的非商业修改及分发；
+              未经版权方书面授权，<strong>严禁任何形式的商业使用</strong>（包括出售、收费打包/代安装、嵌入商业软硬件、商业化 SaaS/广告分发及企业商业运营部署）。
+            </p>
+          </div>
+          <a class="btn btn-ghost" href="https://github.com/idefav/SmartPinyin/blob/main/LICENSE" target="_blank" rel="noopener">查看完整协议</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <img src="./favicon.svg" alt="" width="24" height="24" />
+        <span>SmartPinyin · Built with native Swift, librime &amp; Metal GPU</span>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/idefav/SmartPinyin" target="_blank" rel="noopener">源码仓库</a>
+        <a href="https://github.com/idefav/SmartPinyin/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/idefav/SmartPinyin/blob/main/LICENSE" target="_blank" rel="noopener">LICENSE</a>
+        <a href="https://github.com/idefav/SmartPinyin/blob/main/THIRD_PARTY_NOTICES.md" target="_blank" rel="noopener">第三方致谢</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

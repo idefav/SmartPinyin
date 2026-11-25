@@ -1,0 +1,54 @@
+MIT Non-Commercial License (Personal Use Only)
+
+Copyright (c) 2026 idefav
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software solely for personal, non-commercial use, including the rights
+to use, copy, modify, merge, and distribute copies of the Software for
+personal, educational, or non-commercial research purposes, subject to the
+following conditions:
+
+1. NON-COMMERCIAL / PERSONAL USE ONLY:
+   The Software and any derivative works based on the Software may ONLY be used
+   for personal, non-commercial purposes. Any commercial use is strictly
+   prohibited without prior written authorization from the copyright holder.
+   Prohibited commercial uses include, without limitation:
+   - Selling, sublicensing, renting, leasing, or charging any fee for the
+     Software, derivative works, installation, hosting, or technical support;
+   - Bundling, embedding, or integrating the Software or any portion thereof
+     into any commercial product, commercial software, hardware device, SaaS,
+     or paid/monetized service (including ad-supported distribution);
+   - Deploying or using the Software within a commercial enterprise, business,
+     or organization for commercial operations or commercial gain.
+
+2. ATTRIBUTION AND NOTICE:
+   The above copyright notice, this permission notice, and the non-commercial
+   restriction in Section 1 shall be included in all copies or substantial
+   portions of the Software, including any modified or derivative versions.
+
+3. THIRD-PARTY COMPONENTS:
+   This repository integrates or downloads third-party open-source libraries,
+   dictionaries, corpora, and AI models (see THIRD_PARTY_NOTICES.md). Those
+   third-party components remain subject to their own respective licenses.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+中文摘要说明（仅供参考，如与上方英文条款存在歧义，以英文正文为准）
+================================================================================
+
+本协议基于 MIT 协议修订，仅授权【个人非商业使用】：
+- 允许：个人日常使用、学习、研究、复制、修改、合并及在保留本协议与版权声明前提下
+  进行非商业性质的分发。
+- 禁止：未经版权方事先书面授权，严禁任何形式的商业使用，包括但不限于：出售、
+  付费分发/打包/代安装、嵌入商业软件或硬件产品、商业化 SaaS/增值服务、广告变现
+  分发，以及企业/商业机构用于商业运营目的的部署或使用。
+- 第三方组件：项目所集成或按需下载的第三方开源引擎、词库与模型遵循各自原开源协议，
+  详见 THIRD_PARTY_NOTICES.md。
