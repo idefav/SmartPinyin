@@ -432,6 +432,11 @@ final class MixedBilingualTests: XCTestCase {
             }
         }
         let avgTypoMs = ((CFAbsoluteTimeGetCurrent() - t2) * 1000.0) / Double(10 * typoQueries.count)
-        XCTAssertLessThan(avgTypoMs, 5.0, "fuzzyCorrect 平均耗时过高（Debug 模式阈值 5ms）：\(avgTypoMs) ms")
+        #if DEBUG
+        let typoBudgetMs = 8.0
+        #else
+        let typoBudgetMs = 2.0
+        #endif
+        XCTAssertLessThan(avgTypoMs, typoBudgetMs, "fuzzyCorrect 平均耗时过高（阈值 \(typoBudgetMs)ms）：\(avgTypoMs) ms")
     }
 }

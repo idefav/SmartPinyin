@@ -164,7 +164,7 @@ public final class EnglishLexiconStore: @unchecked Sendable {
         "n": (2, 5.75), "m": (2, 6.75)
     ]
 
-    private static let alphabet: [Character] = Array("abcdefghijklmnopqrstuvwxyz")
+    private static let alphabetBytes: [UInt8] = Array(UInt8(ascii: "a")...UInt8(ascii: "z"))
 
     /// 内存构造器（单测或自定义词表注入）
     public init(extraEntries: [EnglishLexiconEntry] = []) {
@@ -303,30 +303,31 @@ public final class EnglishLexiconStore: @unchecked Sendable {
         }
 
         var bestByLower: [String: (entry: EnglishLexiconEntry, cost: Double)] = [:]
-        func consider(_ candidateLower: String, cost: Double) {
+        func consider(_ candidateLower: String, cost: @autoclosure () -> Double) {
             guard candidateLower != lower,
-                  candidateLower.count >= 3 || Self.curatedTwoLetterAllowlist.contains(candidateLower),
+                  candidateLower.utf8.count >= 3 || Self.curatedTwoLetterAllowlist.contains(candidateLower),
                   let entry = dict[candidateLower]
             else { return }
             // 过滤极生僻低频词（避免把乱打字母强行纠成冷门专有名词）
             if !entry.isCuratedTech && entry.weight < 25 {
                 return
             }
-            if let prev = bestByLower[candidateLower], prev.cost <= cost {
+            let c = cost()
+            if let prev = bestByLower[candidateLower], prev.cost <= c {
                 return
             }
-            bestByLower[candidateLower] = (entry, cost)
+            bestByLower[candidateLower] = (entry, c)
         }
 
-        let chars = Array(lower)
-        let n = chars.count
+        let bytes = Array(lower.utf8)
+        let n = bytes.count
 
         // --- Tier 1A: 相邻字母倒序（gti -> git, recat -> react, dokcer -> docker, githbu -> GitHub）---
         if n >= 3 {
-            var buf = chars
+            var buf = bytes
             for i in 0..<(n - 1) where buf[i] != buf[i + 1] {
                 buf.swapAt(i, i + 1)
-                consider(String(buf), cost: 0.45)
+                consider(String(decoding: buf, as: UTF8.self), cost: 0.45)
                 buf.swapAt(i, i + 1)
             }
         }
@@ -334,48 +335,68 @@ public final class EnglishLexiconStore: @unchecked Sendable {
         // 3 字母串仅允许倒序（如 gti -> git / teh -> the），避免过度纠偏
         if n >= 4 {
             // --- Tier 1B: 删除多余字母 / 去双写连键（gitt -> git, dockker -> docker, reacct -> react）---
+            var delBuf = [UInt8](repeating: 0, count: n - 1)
             for i in 0..<n {
-                let isDouble = (i > 0 && chars[i] == chars[i - 1]) || (i + 1 < n && chars[i] == chars[i + 1])
-                var s = ""
-                s.reserveCapacity(n - 1)
-                for j in 0..<n where j != i { s.append(chars[j]) }
-                consider(s, cost: isDouble ? 0.40 : 0.65)
+                let isDouble = (i > 0 && bytes[i] == bytes[i - 1]) || (i + 1 < n && bytes[i] == bytes[i + 1])
+                var dst = 0
+                for j in 0..<n where j != i {
+                    delBuf[dst] = bytes[j]
+                    dst += 1
+                }
+                consider(String(decoding: delBuf, as: UTF8.self), cost: isDouble ? 0.40 : 0.65)
             }
 
             // --- Tier 1C: QWERTY 加权单字母替换（doxker -> docker, reavt -> react, pythin -> python）---
-            var buf = chars
+            var subBuf = bytes
             for i in 0..<n {
-                let orig = chars[i]
-                for rep in Self.alphabet where rep != orig {
-                    buf[i] = rep
-                    let subCost = Self.substitutionCost(from: orig, to: rep)
-                    consider(String(buf), cost: subCost)
+                let orig = bytes[i]
+                for rep in Self.alphabetBytes where rep != orig {
+                    subBuf[i] = rep
+                    consider(
+                        String(decoding: subBuf, as: UTF8.self),
+                        cost: Self.substitutionCost(from: Character(UnicodeScalar(orig)), to: Character(UnicodeScalar(rep)))
+                    )
                 }
-                buf[i] = orig
+                subBuf[i] = orig
             }
 
             // --- Tier 1D: 补漏单字母（doker -> docker, pyton -> python, enviroment -> environment）---
+            var insBuf = [UInt8](repeating: 0, count: n + 1)
             for pos in 0...n {
-                for ins in Self.alphabet {
-                    var s = ""
-                    s.reserveCapacity(n + 1)
-                    if pos > 0 { s.append(contentsOf: chars[0..<pos]) }
-                    s.append(ins)
-                    if pos < n { s.append(contentsOf: chars[pos..<n]) }
-                    consider(s, cost: 0.72)
+                for j in 0..<pos { insBuf[j] = bytes[j] }
+                for j in pos..<n { insBuf[j + 1] = bytes[j] }
+                for ins in Self.alphabetBytes {
+                    insBuf[pos] = ins
+                    consider(String(decoding: insBuf, as: UTF8.self), cost: 0.72)
                 }
             }
         }
 
+        // 复用 DP 行缓冲，避免在 extraTokens / Tier 2 循环内产生任何临时数组分配
+        var dpPrev2 = [Int](repeating: 0, count: 26)
+        var dpPrev1 = [Int](repeating: 0, count: 26)
+        var dpCurr = [Int](repeating: 0, count: 26)
+
         // 额外检查文档/工作记忆中的自定义标识符（1-edit / 2-edit）
         if !extraTokens.isEmpty && n >= 4 {
             for tok in extraTokens {
-                let tLower = tok.lowercased()
-                guard tLower != lower, abs(tLower.count - n) <= 2,
-                      tLower.unicodeScalars.allSatisfy({ $0.value >= 97 && $0.value <= 122 })
+                var tLower = tok.lowercased()
+                let tLen = tLower.utf8.count
+                guard tLower != lower, tLen <= 24, abs(tLen - n) <= 2,
+                      tLower.utf8.allSatisfy({ $0 >= 97 && $0 <= 122 })
                 else { continue }
                 let maxDist = n >= 6 ? 2 : 1
-                if let dist = Self.boundedDamerauDistance(chars, Array(tLower), maxDist: maxDist), dist > 0 {
+                let dist: Int? = tLower.withUTF8 { tBuf in
+                    Self.boundedDamerauDistanceUTF8(
+                        bytes,
+                        tBuf,
+                        maxDist: maxDist,
+                        prev2: &dpPrev2,
+                        prev1: &dpPrev1,
+                        curr: &dpCurr
+                    )
+                }
+                if let dist, dist > 0 {
                     let cost = dist == 1 ? 0.55 : 1.15
                     let entry = EnglishLexiconEntry(
                         display: tok,
@@ -396,15 +417,15 @@ public final class EnglishLexiconStore: @unchecked Sendable {
         if n >= 5 && strongTier1Count < 2 {
             let minLen = max(4, n - 2)
             let maxLen = min(20, n + 2)
-            let qFirst = chars[0]
-            let qSecond = chars[1]
-            let qLast = chars[n - 1]
+            let qFirst = bytes[0]
+            let qSecond = bytes[1]
+            let qLast = bytes[n - 1]
 
             let poolByLen: [Int: [EnglishLexiconEntry]]
             if curatedOnly {
                 var m: [Int: [EnglishLexiconEntry]] = [:]
-                for e in snap.curatedEntries where e.isPureAlpha && e.lower.count >= minLen && e.lower.count <= maxLen {
-                    m[e.lower.count, default: []].append(e)
+                for e in snap.curatedEntries where e.isPureAlpha && e.lower.utf8.count >= minLen && e.lower.utf8.count <= maxLen {
+                    m[e.lower.utf8.count, default: []].append(e)
                 }
                 poolByLen = m
             } else {
@@ -414,17 +435,28 @@ public final class EnglishLexiconStore: @unchecked Sendable {
             for len in minLen...maxLen {
                 guard let bucket = poolByLen[len] else { continue }
                 for entry in bucket {
-                    if bestByLower[entry.lower] != nil { continue }
-                    let tChars = Array(entry.lower)
-                    // O(1) 几何锚点剪枝：首字母/次字母/尾字母至少 1 处贴合，淘汰 ~90% 无关词
-                    if tChars[0] != qFirst && tChars[1] != qFirst && tChars[0] != qSecond && tChars[tChars.count - 1] != qLast {
+                    // 较短词（len == 5）对 2-edit 提前按权重剪枝，仅放行精选技术词或极高频词
+                    if n == 5 && !entry.isCuratedTech && entry.weight < 600 {
                         continue
                     }
-                    if let dist = Self.boundedDamerauDistance(chars, tChars, maxDist: 2), dist == 2 {
-                        // 较短词（len == 5）对 2-edit 提高门槛，仅放行精选技术词或极高频词
-                        if n == 5 && !entry.isCuratedTech && entry.weight < 600 {
-                            continue
+                    var tLower = entry.lower
+                    let dist: Int? = tLower.withUTF8 { tBuf in
+                        let tCount = tBuf.count
+                        guard tCount >= 2 else { return nil }
+                        // O(1) 零分配几何锚点剪枝：首字母/次字母/尾字母至少 1 处贴合，淘汰 ~90% 无关词
+                        if tBuf[0] != qFirst && tBuf[1] != qFirst && tBuf[0] != qSecond && tBuf[tCount - 1] != qLast {
+                            return nil
                         }
+                        return Self.boundedDamerauDistanceUTF8(
+                            bytes,
+                            tBuf,
+                            maxDist: 2,
+                            prev2: &dpPrev2,
+                            prev1: &dpPrev1,
+                            curr: &dpCurr
+                        )
+                    }
+                    if dist == 2 && bestByLower[entry.lower] == nil {
                         let cost = (n >= 8 || entry.isCuratedTech) ? 1.15 : 1.30
                         bestByLower[entry.lower] = (entry, cost)
                     }
@@ -491,35 +523,53 @@ public final class EnglishLexiconStore: @unchecked Sendable {
         return 0.92
     }
 
-    /// 有界 Optimal String Alignment（Damerau-Levenshtein）距离：超出 maxDist 提前剪枝返回 nil
-    private static func boundedDamerauDistance(_ a: [Character], _ b: [Character], maxDist: Int) -> Int? {
+    /// 零分配有界 Optimal String Alignment（Damerau-Levenshtein）ASCII UTF-8 距离：超出 maxDist 提前剪枝返回 nil
+    private static func boundedDamerauDistanceUTF8(
+        _ a: [UInt8],
+        _ b: UnsafeBufferPointer<UInt8>,
+        maxDist: Int,
+        prev2: inout [Int],
+        prev1: inout [Int],
+        curr: inout [Int]
+    ) -> Int? {
         let m = a.count
         let n = b.count
         if abs(m - n) > maxDist { return nil }
         if m == 0 { return n <= maxDist ? n : nil }
         if n == 0 { return m <= maxDist ? m : nil }
+        if n + 1 > prev1.count {
+            prev2 = [Int](repeating: 0, count: n + 1)
+            prev1 = [Int](repeating: 0, count: n + 1)
+            curr = [Int](repeating: 0, count: n + 1)
+        }
 
         let inf = maxDist + 1
-        var prev2 = [Int](repeating: inf, count: n + 1)
-        var prev1 = [Int](repeating: inf, count: n + 1)
-        var curr = [Int](repeating: inf, count: n + 1)
-        for j in 0...n { prev1[j] = j }
+        for j in 0...n {
+            prev2[j] = inf
+            prev1[j] = j
+        }
 
         for i in 1...m {
             let jStart = max(1, i - maxDist)
             let jEnd = min(n, i + maxDist)
-            for j in 0...n { curr[j] = inf }
+            if jStart > 1 { curr[jStart - 1] = inf }
+            if jEnd < n { curr[jEnd + 1] = inf }
             curr[0] = i
             var rowMin = curr[0]
+            let ai = a[i - 1]
+            let aiPrev: UInt8 = i > 1 ? a[i - 2] : 0
 
             for j in jStart...jEnd {
-                let cost = (a[i - 1] == b[j - 1]) ? 0 : 1
-                var best = min(
-                    prev1[j] + 1,
-                    min(curr[j - 1] + 1, prev1[j - 1] + cost)
-                )
-                if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                    best = min(best, prev2[j - 2] + 1)
+                let bj = b[j - 1]
+                let cost = (ai == bj) ? 0 : 1
+                var best = prev1[j] + 1
+                let ins = curr[j - 1] + 1
+                if ins < best { best = ins }
+                let sub = prev1[j - 1] + cost
+                if sub < best { best = sub }
+                if i > 1 && j > 1 && ai == b[j - 2] && aiPrev == bj {
+                    let trans = prev2[j - 2] + 1
+                    if trans < best { best = trans }
                 }
                 curr[j] = best
                 if best < rowMin { rowMin = best }
